@@ -70,12 +70,12 @@ func (d *DB) ListResources(ctx context.Context, find *store.FindResource) ([]*st
 		where, args = append(where, "`storage_type` = ?"), append(args, find.StorageType.String())
 	}
 
-	fields := []string{"`id`", "`uid`", "`filename`", "`type`", "`size`", "`creator_id`", "`created_ts`", "`updated_ts`", "`memo_id`", "`storage_type`", "`reference`", "`payload`"}
+	fields := []string{"`id`", "`uid`", "`filename`", "`type`", "`size`", "`creator_id`", "UNIX_TIMESTAMP(`created_ts`)", "UNIX_TIMESTAMP(`updated_ts`)", "`memo_id`", "`storage_type`", "`reference`", "`payload`"}
 	if find.GetBlob {
 		fields = append(fields, "`blob`")
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM `resource` WHERE %s ORDER BY `created_ts` DESC", strings.Join(fields, ", "), strings.Join(where, " AND "))
+	query := fmt.Sprintf("SELECT %s FROM `resource` WHERE %s ORDER BY `updated_ts` DESC", strings.Join(fields, ", "), strings.Join(where, " AND "))
 	if find.Limit != nil {
 		query = fmt.Sprintf("%s LIMIT %d", query, *find.Limit)
 		if find.Offset != nil {
