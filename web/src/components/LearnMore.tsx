@@ -1,6 +1,6 @@
-import { Tooltip } from "@mui/joy";
+import { Tooltip } from "@usememos/ui";
+import { ExternalLinkIcon } from "lucide-react";
 import { useTranslate } from "@/utils/i18n";
-import Icon from "./Icon";
 
 interface Props {
   className?: string;
@@ -13,11 +13,16 @@ const LearnMore: React.FC<Props> = (props: Props) => {
   const t = useTranslate();
 
   return (
-    <Tooltip title={title ?? t("common.learn-more")} placement="top">
-      <a className={`text-gray-500 dark:text-gray-400 hover:text-blue-600 ${className}`} href={url} target="_blank">
-        <Icon.ExternalLink className="w-4 h-auto" />
-      </a>
-    </Tooltip>
+    <Tooltip.Provider>
+      <Tooltip.Root>
+        <Tooltip.Trigger render={<a className={`text-mu-text-secondary hover:text-mu-accent ${className}`} href={url} target="_blank" />}>
+          <ExternalLinkIcon className="mu-icon" />
+        </Tooltip.Trigger>
+        <Tooltip.Popup>
+          <p>{title ?? t("common.learn-more")}</p>
+        </Tooltip.Popup>
+      </Tooltip.Root>
+    </Tooltip.Provider>
   );
 };
 

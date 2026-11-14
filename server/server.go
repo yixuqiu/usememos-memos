@@ -6,31 +6,54 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path"
+	"sync"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
 	"github.com/pkg/errors"
-	"github.com/soheilhy/cmux"
-	"google.golang.org/grpc"
 
+	"github.com/usememos/memos/core/memopayload"
+	"github.com/usememos/memos/internal/clientip"
+	"github.com/usememos/memos/internal/httphandler"
+	"github.com/usememos/memos/internal/profile"
 	storepb "github.com/usememos/memos/proto/gen/store"
-	"github.com/usememos/memos/server/profile"
-	apiv1 "github.com/usememos/memos/server/router/api/v1"
-	"github.com/usememos/memos/server/router/frontend"
-	"github.com/usememos/memos/server/router/rss"
-	s3objectpresigner "github.com/usememos/memos/server/service/s3_object_presigner"
-	versionchecker "github.com/usememos/memos/server/service/version_checker"
+	"github.com/usememos/memos/server/api"
+	"github.com/usememos/memos/server/fileserver"
+	"github.com/usememos/memos/server/frontend"
+	"github.com/usememos/memos/server/mcp"
 	"github.com/usememos/memos/store"
 )
+
+const (
+	shutdownTimeout = 10 * time.Second
+
+	// readHeaderTimeout bounds how long a client may take to send request
+	// headers, so idle or slow connections cannot pin a worker forever. Bodies
+	// and responses are not bounded here: uploads and SSE streams are
+	// legitimately long, and the request context still ends on disconnect.
+	readHeaderTimeout = 15 * time.Second
+	// idleTimeout closes keep-alive connections that send nothing.
+	idleTimeout = 2 * time.Minute
+)
+
+// healthzDatabaseTimeout bounds the database ping behind /healthz.
+const healthzDatabaseTimeout = 2 * time.Second
 
 type Server struct {
 	Secret  string
 	Profile *profile.Profile
 	Store   *store.Store
 
-	echoServer *echo.Echo
-	grpcServer *grpc.Server
+	handler    http.Handler
+	httpServer *http.Server
+	apiService *api.APIService
+
+	// backgroundCancel stops the startup jobs, and backgroundJobs waits for
+	// them, before the store closes.
+	backgroundCancel context.CancelFunc
+	backgroundJobs   sync.WaitGroup
 }
 
 func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store) (*Server, error) {
@@ -39,126 +62,183 @@ func NewServer(ctx context.Context, profile *profile.Profile, store *store.Store
 		Profile: profile,
 	}
 
-	echoServer := echo.New()
-	echoServer.Debug = true
-	echoServer.HideBanner = true
-	echoServer.HidePort = true
-	s.echoServer = echoServer
-
-	workspaceBasicSetting, err := s.getOrUpsertWorkspaceBasicSetting(ctx)
+	mux := http.NewServeMux()
+	// Resolve the client address once per request, before anything that keys
+	// on it: rate limits, session records, and the file server.
+	clientIPResolver, err := clientip.ParseTrustedProxies(profile.TrustedProxies)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get workspace basic setting")
+		return nil, errors.Wrap(err, "invalid trusted proxies")
+	}
+
+	instanceBasicSetting, err := s.getOrUpsertInstanceBasicSetting(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get instance basic setting")
 	}
 
 	secret := "usememos"
-	if profile.Mode == "prod" {
-		secret = workspaceBasicSetting.SecretKey
+	if !profile.Demo {
+		secret = instanceBasicSetting.SecretKey
 	}
 	s.Secret = secret
 
-	// Register healthz endpoint.
-	echoServer.GET("/healthz", func(c echo.Context) error {
-		return c.String(http.StatusOK, "Service ready.")
-	})
+	// Register healthz endpoint. It reports ready only while the database
+	// answers, so a load balancer stops routing to an instance that lost it.
+	mux.Handle("/healthz", httphandler.GET(httphandler.Func(func(w http.ResponseWriter, r *http.Request) error {
+		pingCtx, cancel := context.WithTimeout(r.Context(), healthzDatabaseTimeout)
+		defer cancel()
+		if err := s.Store.GetDriver().GetDB().PingContext(pingCtx); err != nil {
+			slog.Warn("health check failed to reach the database", slog.String("error", err.Error()))
+			return httphandler.Text(w, http.StatusServiceUnavailable, "Database unavailable.")
+		}
+		return httphandler.Text(w, http.StatusOK, "Service ready.")
+	}), nil))
 
-	// Serve frontend resources.
-	frontend.NewFrontendService(profile, store).Serve(ctx, echoServer)
+	apiService := api.NewAPIService(s.Secret, profile, store)
+	s.apiService = apiService
 
-	rootGroup := echoServer.Group("")
-
-	// Create and register RSS routes.
-	rss.NewRSSService(s.Profile, s.Store).RegisterRoutes(rootGroup)
-
-	grpcServer := grpc.NewServer(
-		// Override the maximum receiving message size to 100M for uploading large resources.
-		grpc.MaxRecvMsgSize(100*1024*1024),
-		grpc.ChainUnaryInterceptor(
-			apiv1.NewLoggerInterceptor().LoggerInterceptor,
-			apiv1.NewGRPCAuthInterceptor(store, secret).AuthenticationInterceptor,
-		))
-	s.grpcServer = grpcServer
-
-	apiV1Service := apiv1.NewAPIV1Service(s.Secret, profile, store, grpcServer)
-	// Register gRPC gateway as api v1.
-	if err := apiV1Service.RegisterGateway(ctx, echoServer); err != nil {
-		return nil, errors.Wrap(err, "failed to register gRPC gateway")
+	apiHandler, err := apiService.NewHandler(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create API handler")
 	}
+	frontendService := frontend.NewFrontendService(profile, store)
+	frontendService.Serve(ctx, mux, apiHandler)
+	fileServerService := fileserver.NewFileServerService(s.Profile, s.Store, s.Secret)
+	fileServerService.MemoExporter = apiService
+	fileServerService.RateLimiter = apiService.RateLimiter
+	fileServerService.RegisterRoutes(mux, apiHandler)
+	// Preserve unclean-path routing without ServeMux's automatic redirects.
+	fallback := frontendService.Handler(apiHandler)
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		frontend.SetCacheHeaders(w, r)
+		routingRequest := httphandler.RoutingRequest(r)
+		if path.Clean(routingRequest.URL.Path) != routingRequest.URL.Path && routingRequest.URL.Path != "/" {
+			fallback.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, routingRequest)
+	})
+	s.handler = httphandler.Recover(clientip.Middleware(clientIPResolver)(newCORSMiddleware(profile, mux)(router)))
+
+	mcpService, err := mcp.NewMCPService(profile, s.handler)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create MCP service")
+	}
+	mcpService.RegisterRoutes(mux)
 
 	return s, nil
 }
 
-func (s *Server) Start(ctx context.Context) error {
-	address := fmt.Sprintf(":%d", s.Profile.Port)
-	listener, err := net.Listen("tcp", address)
+func (s *Server) Start() error {
+	var address, network string
+	if len(s.Profile.UNIXSock) == 0 {
+		address = fmt.Sprintf("%s:%d", s.Profile.Addr, s.Profile.Port)
+		network = "tcp"
+	} else {
+		address = s.Profile.UNIXSock
+		network = "unix"
+	}
+	listener, err := net.Listen(network, address)
 	if err != nil {
 		return errors.Wrap(err, "failed to listen")
 	}
 
-	muxServer := cmux.New(listener)
-	go func() {
-		grpcListener := muxServer.MatchWithWriters(cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"))
-		if err := s.grpcServer.Serve(grpcListener); err != nil {
-			slog.Error("failed to serve gRPC", err)
+	if network == "unix" {
+		if err := os.Chmod(address, 0660); err != nil {
+			_ = listener.Close()
+			return errors.Wrap(err, "failed to chmod socket")
 		}
-	}()
-	go func() {
-		httpListener := muxServer.Match(cmux.HTTP1Fast())
-		s.echoServer.Listener = httpListener
-		if err := s.echoServer.Start(address); err != nil {
-			slog.Error("failed to start echo server", err)
-		}
-	}()
-	go func() {
-		if err := muxServer.Serve(); err != nil {
-			slog.Error("mux server listen error", err)
-		}
-	}()
-	s.StartBackgroundRunners(ctx)
+	}
 
+	// All transports share the standard HTTP server.
+	s.httpServer = &http.Server{
+		Handler:           s.handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+	go func() {
+		if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("failed to start HTTP server", "error", err)
+		}
+	}()
+
+	s.startBackgroundJobs()
 	return nil
 }
 
+// startBackgroundJobs runs one-off data jobs that must not delay serving.
+func (s *Server) startBackgroundJobs() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.backgroundCancel = cancel
+	runner := memopayload.NewRunner(s.Store, s.apiService.MarkdownService)
+	s.backgroundJobs.Go(func() {
+		if err := runner.Backfill(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("failed to rebuild memo payloads; retrying on next start", slog.String("error", err.Error()))
+		}
+	})
+}
+
+func (s *Server) stopBackgroundJobs() {
+	if s.backgroundCancel != nil {
+		s.backgroundCancel()
+	}
+	s.backgroundJobs.Wait()
+}
+
 func (s *Server) Shutdown(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 	defer cancel()
 
-	// Shutdown echo server.
-	if err := s.echoServer.Shutdown(ctx); err != nil {
-		fmt.Printf("failed to shutdown server, error: %v\n", err)
-	}
+	slog.Info("server shutting down")
+
+	s.closeLongLivedConnections()
+	s.shutdownHTTPServer(ctx)
+	s.apiService.CloseUploads()
+	s.stopBackgroundJobs()
 
 	// Close database connection.
 	if err := s.Store.Close(); err != nil {
-		fmt.Printf("failed to close database, error: %v\n", err)
+		slog.Error("failed to close database", slog.String("error", err.Error()))
 	}
 
-	fmt.Printf("memos stopped properly\n")
+	slog.Info("memos stopped properly")
 }
 
-func (s *Server) StartBackgroundRunners(ctx context.Context) {
-	go versionchecker.NewVersionChecker(s.Store, s.Profile).Start(ctx)
-	go s3objectpresigner.NewS3ObjectPresigner(s.Store).Start(ctx)
+func (s *Server) closeLongLivedConnections() {
+	// Long-lived SSE requests do not finish on their own during http.Server.Shutdown.
+	s.apiService.SSEHub.Close()
 }
 
-func (s *Server) getOrUpsertWorkspaceBasicSetting(ctx context.Context) (*storepb.WorkspaceBasicSetting, error) {
-	workspaceBasicSetting, err := s.Store.GetWorkspaceBasicSetting(ctx)
+func (s *Server) shutdownHTTPServer(ctx context.Context) {
+	if s.httpServer == nil {
+		return
+	}
+	if err := s.httpServer.Shutdown(ctx); err != nil {
+		slog.Error("failed to shutdown server", slog.String("error", err.Error()))
+		if closeErr := s.httpServer.Close(); closeErr != nil && closeErr != http.ErrServerClosed {
+			slog.Error("failed to close server", slog.String("error", closeErr.Error()))
+		}
+	}
+}
+
+func (s *Server) getOrUpsertInstanceBasicSetting(ctx context.Context) (*storepb.InstanceBasicSetting, error) {
+	instanceBasicSetting, err := s.Store.GetInstanceBasicSetting(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get workspace basic setting")
+		return nil, errors.Wrap(err, "failed to get instance basic setting")
 	}
 	modified := false
-	if workspaceBasicSetting.SecretKey == "" {
-		workspaceBasicSetting.SecretKey = uuid.NewString()
+	if instanceBasicSetting.SecretKey == "" {
+		instanceBasicSetting.SecretKey = uuid.NewV4().String()
 		modified = true
 	}
 	if modified {
-		workspaceSetting, err := s.Store.UpsertWorkspaceSetting(ctx, &storepb.WorkspaceSetting{
-			Key:   storepb.WorkspaceSettingKey_WORKSPACE_SETTING_BASIC,
-			Value: &storepb.WorkspaceSetting_BasicSetting{BasicSetting: workspaceBasicSetting},
+		instanceSetting, err := s.Store.UpsertInstanceSetting(ctx, &storepb.InstanceSetting{
+			Key:   storepb.InstanceSettingKey_BASIC,
+			Value: &storepb.InstanceSetting_BasicSetting{BasicSetting: instanceBasicSetting},
 		})
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to upsert workspace setting")
+			return nil, errors.Wrap(err, "failed to upsert instance setting")
 		}
-		workspaceBasicSetting = workspaceSetting.GetBasicSetting()
+		instanceBasicSetting = instanceSetting.GetBasicSetting()
 	}
-	return workspaceBasicSetting, nil
+	return instanceBasicSetting, nil
 }

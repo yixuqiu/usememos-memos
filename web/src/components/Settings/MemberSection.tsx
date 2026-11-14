@@ -1,245 +1,231 @@
-import { Button, Dropdown, Input, Menu, MenuButton, MenuItem, Radio, RadioGroup } from "@mui/joy";
+import { create } from "@bufbuild/protobuf";
+import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
+import { Badge, Button, List, Menu, Tooltip } from "@usememos/ui";
 import { sortBy } from "lodash-es";
-import React, { useEffect, useState } from "react";
-import { toast } from "react-hot-toast";
-import { userServiceClient } from "@/grpcweb";
+import { MoreVerticalIcon, PlusIcon } from "lucide-react";
+import { useMemo, useState } from "react";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import InfoChip from "@/components/Settings/InfoChip";
+import UserAvatar from "@/components/UserAvatar";
+import { userServiceClient } from "@/connect";
+import { findManagedResource, useConfigurationStatus } from "@/hooks/useConfigurationQueries";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { stringifyUserRole, useUserStore } from "@/store/v1";
-import { RowStatus } from "@/types/proto/api/v1/common";
-import { User, User_Role } from "@/types/proto/api/v1/user_service";
+import { useDialog } from "@/hooks/useDialog";
+import { useDeleteUser, useListUsers } from "@/hooks/useUserQueries";
+import { handleError } from "@/lib/error";
+import { showErrorToast, toast } from "@/lib/toast";
+import { State } from "@/types/proto/api/common_pb";
+import { User, User_Role } from "@/types/proto/api/user_service_pb";
 import { useTranslate } from "@/utils/i18n";
-import showChangeMemberPasswordDialog from "../ChangeMemberPasswordDialog";
-import { showCommonDialog } from "../Dialog/CommonDialog";
-import Icon from "../Icon";
-
-interface State {
-  creatingUser: User;
-}
+import CreateUserDialog from "../CreateUserDialog";
+import ManagedByConfigurationChip from "./ManagedByConfigurationChip";
+import { SettingList } from "./SettingList";
+import SettingSection from "./SettingSection";
+import { useExportMemos } from "./useExportMemos";
 
 const MemberSection = () => {
   const t = useTranslate();
+  const configurationStatus = useConfigurationStatus();
   const currentUser = useCurrentUser();
-  const userStore = useUserStore();
-  const [state, setState] = useState<State>({
-    creatingUser: User.fromPartial({
-      username: "",
-      password: "",
-      role: User_Role.USER,
-    }),
-  });
-  const [users, setUsers] = useState<User[]>([]);
-  const sortedUsers = sortBy(users, "id");
+  const { data: users = [], refetch: refetchUsers } = useListUsers();
+  const deleteUserMutation = useDeleteUser();
+  const { exportMemos, exporting } = useExportMemos();
+  const createDialog = useDialog();
+  const editDialog = useDialog();
+  const [editingUser, setEditingUser] = useState<User | undefined>();
+  const sortedUsers = useMemo(() => sortBy(users, "id"), [users]);
+  const [archiveTarget, setArchiveTarget] = useState<User | undefined>(undefined);
+  const [deleteTarget, setDeleteTarget] = useState<User | undefined>(undefined);
 
-  useEffect(() => {
-    fetchUsers();
-  }, []);
+  const stringifyUserRole = (role: User_Role) => (role === User_Role.ADMIN ? t("setting.member.admin") : t("setting.member.user"));
 
-  const fetchUsers = async () => {
-    const users = await userStore.fetchUsers();
-    setUsers(users);
+  const handleCreateUser = () => {
+    setEditingUser(undefined);
+    createDialog.open();
   };
 
-  const handleUsernameInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    setState({
-      ...state,
-      creatingUser: {
-        ...state.creatingUser,
-        username: event.target.value,
-      },
-    });
-  };
-
-  const handlePasswordInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    setState({
-      ...state,
-      creatingUser: {
-        ...state.creatingUser,
-        password: event.target.value,
-      },
-    });
-  };
-
-  const handleUserRoleInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    setState({
-      ...state,
-      creatingUser: {
-        ...state.creatingUser,
-        role: event.target.value as User_Role,
-      },
-    });
-  };
-
-  const handleCreateUserBtnClick = async () => {
-    if (state.creatingUser.username === "" || state.creatingUser.password === "") {
-      toast.error(t("message.fill-all"));
-      return;
-    }
-
-    try {
-      await userServiceClient.createUser({
-        user: {
-          username: state.creatingUser.username,
-          password: state.creatingUser.password,
-          role: state.creatingUser.role,
-        },
-      });
-    } catch (error: any) {
-      toast.error(error.details);
-    }
-    await fetchUsers();
-    setState({
-      ...state,
-      creatingUser: User.fromPartial({
-        username: "",
-        password: "",
-        role: User_Role.USER,
-      }),
-    });
-  };
-
-  const handleChangePasswordClick = (user: User) => {
-    showChangeMemberPasswordDialog(user);
+  const handleEditUser = (user: User) => {
+    setEditingUser(user);
+    editDialog.open();
   };
 
   const handleArchiveUserClick = (user: User) => {
-    showCommonDialog({
-      title: t("setting.member-section.archive-member"),
-      content: t("setting.member-section.archive-warning", { username: user.nickname }),
-      style: "danger",
-      dialogName: "archive-user-dialog",
-      onConfirm: async () => {
-        await userServiceClient.updateUser({
-          user: {
-            name: user.name,
-            rowStatus: RowStatus.ARCHIVED,
-          },
-          updateMask: ["row_status"],
-        });
-        fetchUsers();
-      },
-    });
+    setArchiveTarget(user);
+  };
+
+  const confirmArchiveUser = async () => {
+    if (!archiveTarget) return;
+    const username = archiveTarget.username;
+    try {
+      await userServiceClient.updateUser({
+        user: {
+          name: archiveTarget.name,
+          state: State.ARCHIVED,
+        },
+        updateMask: create(FieldMaskSchema, { paths: ["state"] }),
+      });
+      toast.add({ title: t("setting.member.archive-success", { username }), type: "success" });
+      await refetchUsers();
+    } catch (error: unknown) {
+      handleError(error, showErrorToast, { context: "Archive user" });
+    }
+    setArchiveTarget(undefined);
   };
 
   const handleRestoreUserClick = async (user: User) => {
-    await userServiceClient.updateUser({
-      user: {
-        name: user.name,
-        rowStatus: RowStatus.ACTIVE,
-      },
-      updateMask: ["row_status"],
-    });
-    fetchUsers();
+    const { username } = user;
+    try {
+      await userServiceClient.updateUser({
+        user: {
+          name: user.name,
+          state: State.NORMAL,
+        },
+        updateMask: create(FieldMaskSchema, { paths: ["state"] }),
+      });
+      toast.add({ title: t("setting.member.restore-success", { username }), type: "success" });
+      await refetchUsers();
+    } catch (error: unknown) {
+      handleError(error, showErrorToast, { context: "Restore user" });
+    }
   };
 
   const handleDeleteUserClick = (user: User) => {
-    showCommonDialog({
-      title: t("setting.member-section.delete-member"),
-      content: t("setting.member-section.delete-warning", { username: user.nickname }),
-      style: "danger",
-      dialogName: "delete-user-dialog",
-      onConfirm: async () => {
-        await userStore.deleteUser(user.name);
-        fetchUsers();
+    setDeleteTarget(user);
+  };
+
+  const confirmDeleteUser = () => {
+    if (!deleteTarget) return;
+    const { username, name } = deleteTarget;
+    deleteUserMutation.mutate(name, {
+      onSuccess: () => {
+        setDeleteTarget(undefined);
+        toast.add({ title: t("setting.member.delete-success", { username }), type: "success" });
+      },
+      onError: (error) => {
+        setDeleteTarget(undefined);
+        handleError(error, showErrorToast, { context: "Delete user" });
       },
     });
   };
 
   return (
-    <div className="w-full flex flex-col gap-2 pt-2 pb-4">
-      <p className="font-medium text-gray-700 dark:text-gray-500">{t("setting.member-section.create-a-member")}</p>
-      <div className="w-auto flex flex-col justify-start items-start gap-2 border rounded-md py-2 px-3 dark:border-zinc-700">
-        <div className="flex flex-col justify-start items-start gap-1">
-          <span>{t("common.username")}</span>
-          <Input type="text" placeholder={t("common.username")} value={state.creatingUser.username} onChange={handleUsernameInputChange} />
-        </div>
-        <div className="flex flex-col justify-start items-start gap-1">
-          <span>{t("common.password")}</span>
-          <Input
-            type="password"
-            placeholder={t("common.password")}
-            value={state.creatingUser.password}
-            onChange={handlePasswordInputChange}
-          />
-        </div>
-        <div className="flex flex-col justify-start items-start gap-1">
-          <span>{t("common.role")}</span>
-          <RadioGroup orientation="horizontal" defaultValue={User_Role.USER} onChange={handleUserRoleInputChange}>
-            <Radio value={User_Role.USER} label="User" />
-            <Radio value={User_Role.ADMIN} label="Admin" />
-          </RadioGroup>
-        </div>
-        <div className="mt-2">
-          <Button onClick={handleCreateUserBtnClick}>{t("common.create")}</Button>
-        </div>
-      </div>
-      <div className="w-full flex flex-row justify-between items-center mt-6">
-        <div className="title-text">{t("setting.member-list")}</div>
-      </div>
-      <div className="w-full overflow-x-auto">
-        <div className="inline-block min-w-full align-middle border rounded-lg dark:border-zinc-600">
-          <table className="min-w-full divide-y divide-gray-300 dark:divide-zinc-600">
-            <thead>
-              <tr className="text-sm font-semibold text-left text-gray-900 dark:text-gray-400">
-                <th scope="col" className="px-3 py-2">
-                  ID
-                </th>
-                <th scope="col" className="px-3 py-2">
-                  {t("common.role")}
-                </th>
-                <th scope="col" className="px-3 py-2">
-                  {t("common.username")}
-                </th>
-                <th scope="col" className="px-3 py-2">
-                  {t("common.nickname")}
-                </th>
-                <th scope="col" className="px-3 py-2">
-                  {t("common.email")}
-                </th>
-                <th scope="col" className="relative py-2 pl-3 pr-4"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-200 dark:divide-zinc-600">
-              {sortedUsers.map((user) => (
-                <tr key={user.id}>
-                  <td className="whitespace-nowrap px-3 py-2 text-sm text-gray-900 dark:text-gray-400">{user.id}</td>
-                  <td className="whitespace-nowrap px-3 py-2 text-sm text-gray-500 dark:text-gray-400">{stringifyUserRole(user.role)}</td>
-                  <td className="whitespace-nowrap px-3 py-2 text-sm text-gray-500 dark:text-gray-400">
-                    {user.username}
-                    <span className="ml-1 italic">{user.rowStatus === RowStatus.ARCHIVED && "(Archived)"}</span>
-                  </td>
-                  <td className="whitespace-nowrap px-3 py-2 text-sm text-gray-500 dark:text-gray-400">{user.nickname}</td>
-                  <td className="whitespace-nowrap px-3 py-2 text-sm text-gray-500 dark:text-gray-400">{user.email}</td>
-                  <td className="relative whitespace-nowrap py-2 pl-3 pr-4 text-right text-sm font-medium flex justify-end">
-                    {currentUser?.id === user.id ? (
-                      <span>{t("common.yourself")}</span>
-                    ) : (
-                      <Dropdown>
-                        <MenuButton size="sm">
-                          <Icon.MoreVertical className="w-4 h-auto" />
-                        </MenuButton>
-                        <Menu placement="bottom-end" size="sm">
-                          <MenuItem onClick={() => handleChangePasswordClick(user)}>
-                            {t("setting.account-section.change-password")}
-                          </MenuItem>
-                          {user.rowStatus === RowStatus.ACTIVE ? (
-                            <MenuItem onClick={() => handleArchiveUserClick(user)}>{t("setting.member-section.archive-member")}</MenuItem>
-                          ) : (
-                            <>
-                              <MenuItem onClick={() => handleRestoreUserClick(user)}>{t("common.restore")}</MenuItem>
-                              <MenuItem onClick={() => handleDeleteUserClick(user)}>{t("setting.member-section.delete-member")}</MenuItem>
-                            </>
+    <SettingSection
+      title={t("setting.member.list-title")}
+      actions={
+        <Button variant="primary" onClick={handleCreateUser} icon={<PlusIcon />}>
+          {t("common.create")}
+        </Button>
+      }
+    >
+      {sortedUsers.length === 0 ? (
+        <p className="py-6 text-center mu-body text-mu-text-secondary">{t("setting.member.no-members-found")}</p>
+      ) : (
+        <SettingList aria-label={t("setting.member.list-title")}>
+          {sortedUsers.map((user) => (
+            <List.Item key={user.name} className="flex items-start gap-3">
+              <div className="min-w-0 flex-1 space-y-2">
+                <div className="flex min-w-0 items-start gap-3">
+                  <UserAvatar className="h-10 w-10 shrink-0" avatarUrl={user.avatarUrl} name={user.displayName || user.username} />
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span
+                        className={
+                          user.displayName ? "min-w-0 mu-label break-words text-mu-text" : "mu-label text-mu-text-secondary italic"
+                        }
+                      >
+                        {user.displayName || t("common.empty-placeholder")}
+                      </span>
+                      {currentUser?.name === user.name ? (
+                        <span className="mu-caption text-mu-text-secondary">{t("common.yourself")}</span>
+                      ) : null}
+                    </div>
+                    <span className="truncate mu-caption text-mu-text-secondary">@{user.username}</span>
+                  </div>
+                </div>
+                <div className="flex min-w-0 flex-col gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge>{stringifyUserRole(user.role)}</Badge>
+                    <Badge tone={user.state === State.ARCHIVED ? "outline" : "neutral"}>
+                      {user.state === State.ARCHIVED ? t("setting.member.archived") : t("setting.member.active")}
+                    </Badge>
+                  </div>
+                  {user.email || findManagedResource(configurationStatus, user.name) ? (
+                    <div className="flex flex-wrap gap-2">
+                      {user.email ? <InfoChip label={t("common.email")} value={user.email} tooltip={user.email} /> : null}
+                      <ManagedByConfigurationChip resource={findManagedResource(configurationStatus, user.name)} />
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              {currentUser?.name === user.name ? null : (
+                <div className="shrink-0">
+                  <Menu.Root modal={false}>
+                    <Tooltip.Root>
+                      <Tooltip.Trigger
+                        render={
+                          <Menu.Trigger
+                            render={
+                              <Button variant="ghost" aria-label={`${t("common.more")}: ${user.username}`} icon={<MoreVerticalIcon />} />
+                            }
+                          />
+                        }
+                      />
+                      <Tooltip.Popup>{t("common.more")}</Tooltip.Popup>
+                    </Tooltip.Root>
+                    <Menu.Popup align="end">
+                      <Menu.Item onClick={() => handleEditUser(user)}>{t("common.update")}</Menu.Item>
+                      <Menu.Item disabled={exporting} onClick={() => exportMemos(user.username)}>
+                        {t("setting.member.export-memos")}
+                      </Menu.Item>
+                      {user.state === State.NORMAL ? (
+                        <Menu.Item onClick={() => handleArchiveUserClick(user)}>{t("setting.member.archive-member")}</Menu.Item>
+                      ) : (
+                        <>
+                          <Menu.Item onClick={() => handleRestoreUserClick(user)}>{t("common.restore")}</Menu.Item>
+                          {findManagedResource(configurationStatus, user.name) ? null : (
+                            <Menu.Item onClick={() => handleDeleteUserClick(user)} danger>
+                              {t("setting.member.delete-member")}
+                            </Menu.Item>
                           )}
-                        </Menu>
-                      </Dropdown>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+                        </>
+                      )}
+                    </Menu.Popup>
+                  </Menu.Root>
+                </div>
+              )}
+            </List.Item>
+          ))}
+        </SettingList>
+      )}
+
+      {/* Create User Dialog */}
+      <CreateUserDialog open={createDialog.isOpen} onOpenChange={createDialog.setOpen} onSuccess={refetchUsers} />
+
+      {/* Edit User Dialog */}
+      <CreateUserDialog open={editDialog.isOpen} onOpenChange={editDialog.setOpen} user={editingUser} onSuccess={refetchUsers} />
+
+      <ConfirmDialog
+        open={!!archiveTarget}
+        onOpenChange={(open) => !open && setArchiveTarget(undefined)}
+        title={archiveTarget ? t("setting.member.archive-warning", { username: archiveTarget.username }) : ""}
+        description={archiveTarget ? t("setting.member.archive-warning-description") : ""}
+        confirmLabel={t("common.confirm")}
+        cancelLabel={t("common.cancel")}
+        onConfirm={confirmArchiveUser}
+        confirmVariant="primary"
+      />
+
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => !open && setDeleteTarget(undefined)}
+        title={deleteTarget ? t("setting.member.delete-warning", { username: deleteTarget.username }) : ""}
+        description={deleteTarget ? t("setting.member.delete-warning-description") : ""}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        onConfirm={confirmDeleteUser}
+        confirmVariant="danger"
+      />
+    </SettingSection>
   );
 };
 

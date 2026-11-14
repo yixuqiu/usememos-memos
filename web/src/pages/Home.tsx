@@ -1,119 +1,93 @@
-import { Button } from "@mui/joy";
-import clsx from "clsx";
-import { useCallback, useEffect, useRef, useState } from "react";
-import Empty from "@/components/Empty";
-import { HomeSidebar, HomeSidebarDrawer } from "@/components/HomeSidebar";
-import Icon from "@/components/Icon";
-import MemoEditor from "@/components/MemoEditor";
-import showMemoEditorDialog from "@/components/MemoEditor/MemoEditorDialog";
-import MemoFilter from "@/components/MemoFilter";
+import { useMemo } from "react";
+import { MemoEditor } from "@/components/MemoEditor";
+import { deriveDefaultCreateTimeFromFilters } from "@/components/MemoEditor/edit/utils/deriveDefaultCreateTime";
 import MemoView from "@/components/MemoView";
-import MobileHeader from "@/components/MobileHeader";
-import { DEFAULT_LIST_MEMOS_PAGE_SIZE } from "@/helpers/consts";
-import { getTimeStampByDate } from "@/helpers/datetime";
+import PagedMemoList, { EmptyLine, getMemoKey } from "@/components/PagedMemoList";
+import { useWelcomeGuide, WelcomeGuideDialog } from "@/components/WelcomeGuide";
+import { useAuth } from "@/contexts/AuthContext";
+import { useGlobalMemoEditor } from "@/contexts/GlobalMemoEditorContext";
+import { useMemoFilterContext } from "@/contexts/MemoFilterContext";
+import { NewMemoProvider } from "@/contexts/NewMemoContext";
+import { useSpaceContext } from "@/contexts/SpaceContext";
+import { useMemoFilters, useMemoSorting } from "@/hooks";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import useFilterWithUrlParams from "@/hooks/useFilterWithUrlParams";
-import useResponsiveWidth from "@/hooks/useResponsiveWidth";
-import { useMemoList, useMemoStore } from "@/store/v1";
-import { RowStatus } from "@/types/proto/api/v1/common";
+import { useMemoSuggestions } from "@/hooks/useMemoSuggestions";
+import { State } from "@/types/proto/api/common_pb";
+import { Memo } from "@/types/proto/api/memo_service_pb";
 import { useTranslate } from "@/utils/i18n";
 
 const Home = () => {
-  const t = useTranslate();
-  const { md } = useResponsiveWidth();
   const user = useCurrentUser();
-  const memoStore = useMemoStore();
-  const memoList = useMemoList();
-  const [isRequesting, setIsRequesting] = useState(true);
-  const nextPageTokenRef = useRef<string | undefined>(undefined);
-  const { tag: tagQuery, text: textQuery } = useFilterWithUrlParams();
-  const sortedMemos = memoList.value
-    .filter((memo) => memo.rowStatus === RowStatus.ACTIVE)
-    .sort((a, b) => getTimeStampByDate(b.displayTime) - getTimeStampByDate(a.displayTime))
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  const suggestions = useMemoSuggestions();
+  const t = useTranslate();
+  const { isUserSettingsInitialized } = useAuth();
+  const { claimHomeAutoFocus } = useGlobalMemoEditor();
+  const { filters } = useMemoFilterContext();
+  const { memoFilter: contextFilter, selectedSpaceName, creatorUsername } = useSpaceContext();
+  const defaultCreateTime = useMemo(() => deriveDefaultCreateTimeFromFilters(filters), [filters]);
 
-  useEffect(() => {
-    setIsRequesting(true);
-    nextPageTokenRef.current = undefined;
-    setTimeout(async () => {
-      memoList.reset();
-      const nextPageToken = await fetchMemos();
-      nextPageTokenRef.current = nextPageToken;
-      setIsRequesting(false);
-    });
-  }, [tagQuery, textQuery]);
+  const memoFilter = useMemoFilters({
+    includeMemoViews: true,
+    includePinned: true,
+  });
+  const canComposeInScope = Boolean(user && (!creatorUsername || creatorUsername === user.username));
+  // The welcome guide belongs to the account's own timeline, not to Explore, a space or
+  // another member's page.
+  const onOwnHome = Boolean(user && creatorUsername === user.username);
+  const welcomeGuide = useWelcomeGuide(onOwnHome);
+  // Pinning is the owner's arrangement of their own memos, so it only shapes a single
+  // creator's feed; a mixed-author feed like Explore stays purely chronological.
+  const honorPinned = Boolean(creatorUsername);
 
-  const fetchMemos = async () => {
-    const filters = [`creator == "${user.name}"`, `row_status == "NORMAL"`, `order_by_pinned == true`];
-    const contentSearch: string[] = [];
-    if (textQuery) {
-      contentSearch.push(JSON.stringify(textQuery));
-    }
-    if (contentSearch.length > 0) {
-      filters.push(`content_search == [${contentSearch.join(", ")}]`);
-    }
-    if (tagQuery) {
-      filters.push(`tag == "${tagQuery}"`);
-    }
-    const { nextPageToken } = await memoStore.fetchMemos({
-      pageSize: DEFAULT_LIST_MEMOS_PAGE_SIZE,
-      filter: filters.join(" && "),
-      pageToken: nextPageTokenRef.current,
-    });
-    return nextPageToken;
-  };
-
-  const handleEditPrevious = useCallback(() => {
-    const lastMemo = memoList.value[memoList.value.length - 1];
-    showMemoEditorDialog({
-      memoName: lastMemo.name,
-      cacheKey: `${lastMemo.name}-${lastMemo.displayTime}`,
-    });
-  }, [memoList]);
+  const { listSort, orderBy } = useMemoSorting({
+    pinnedFirst: honorPinned,
+    state: State.NORMAL,
+  });
 
   return (
-    <section className="@container w-full max-w-5xl min-h-full flex flex-col justify-start items-center sm:pt-3 md:pt-6 pb-8">
-      {!md && (
-        <MobileHeader>
-          <HomeSidebarDrawer />
-        </MobileHeader>
-      )}
-      <div className={clsx("w-full flex flex-row justify-start items-start px-4 sm:px-6 gap-4")}>
-        <div className={clsx(md ? "w-[calc(100%-15rem)]" : "w-full")}>
-          <MemoEditor className="mb-2" cacheKey="home-memo-editor" onEditPrevious={handleEditPrevious} />
-          <div className="flex flex-col justify-start items-start w-full max-w-full">
-            <MemoFilter className="px-2 pb-2" />
-            {sortedMemos.map((memo) => (
-              <MemoView key={`${memo.name}-${memo.updateTime}`} memo={memo} showVisibility showPinned />
-            ))}
-            {isRequesting ? (
-              <div className="flex flex-row justify-center items-center w-full my-4 text-gray-400">
-                <Icon.Loader className="w-4 h-auto animate-spin mr-1" />
-                <p className="text-sm italic">{t("memo.fetching-data")}</p>
-              </div>
-            ) : !nextPageTokenRef.current ? (
-              sortedMemos.length === 0 && (
-                <div className="w-full mt-12 mb-8 flex flex-col justify-center items-center italic">
-                  <Empty />
-                  <p className="mt-2 text-gray-600 dark:text-gray-400">{t("message.no-data")}</p>
-                </div>
-              )
-            ) : (
-              <div className="w-full flex flex-row justify-center items-center my-4">
-                <Button variant="plain" endDecorator={<Icon.ArrowDown className="w-5 h-auto" />} onClick={fetchMemos}>
-                  {t("memo.fetch-more")}
-                </Button>
-              </div>
-            )}
-          </div>
-        </div>
-        {md && (
-          <div className="sticky top-0 left-0 shrink-0 -mt-6 w-56 h-full">
-            <HomeSidebar className="py-6" />
-          </div>
-        )}
-      </div>
-    </section>
+    <div className="w-full min-h-full bg-mu-canvas text-mu-text">
+      <WelcomeGuideDialog open={welcomeGuide.open} onOpenChange={welcomeGuide.onOpenChange} />
+      <NewMemoProvider>
+        <PagedMemoList
+          renderer={(memo: Memo, { compact }) => (
+            <MemoView
+              key={getMemoKey(memo)}
+              memo={memo}
+              showCreator={!creatorUsername}
+              showVisibility
+              showPinned={honorPinned}
+              showSpace={!selectedSpaceName}
+              compact={compact}
+            />
+          )}
+          listSort={listSort}
+          orderBy={orderBy}
+          filter={memoFilter}
+          contextFilter={contextFilter}
+          emptyState={
+            <EmptyLine
+              message={t("memo.no-memos-yet")}
+              action={onOwnHome ? t("welcome.reopen") : undefined}
+              onAction={onOwnHome ? welcomeGuide.show : undefined}
+            />
+          }
+          renderLeading={({ useGrid }) => {
+            if (!isUserSettingsInitialized || !canComposeInScope) return null;
+
+            return (
+              <MemoEditor
+                // Each Space keeps its own Home draft; the editor restarts when the Space changes.
+                draft={{ scope: "home", space: selectedSpaceName, createTime: defaultCreateTime }}
+                autoFocus={claimHomeAutoFocus}
+                className={useGrid ? undefined : "mb-2"}
+                placeholder={t("editor.any-thoughts")}
+                suggestions={suggestions}
+              />
+            );
+          }}
+        />
+      </NewMemoProvider>
+    </div>
   );
 };
 

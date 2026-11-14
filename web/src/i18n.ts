@@ -1,32 +1,56 @@
 import i18n, { BackendModule, FallbackLng, FallbackLngObjList } from "i18next";
+import { orderBy } from "lodash-es";
 import { initReactI18next } from "react-i18next";
 import { findNearestMatchedLanguage } from "./utils/i18n";
 
-export const locales = [
+export const locales = orderBy([
   "ar",
+  "az",
+  "bg",
+  "ca",
+  "cs",
+  "da",
   "de",
+  "el",
   "en",
   "en-GB",
   "es",
+  "et",
+  "fa",
+  "fi",
   "fr",
+  "gl",
+  "he",
   "hi",
   "hr",
   "hu",
+  "id",
   "it",
   "ja",
+  "ka-GE",
   "ko",
+  "lt",
+  "lv",
+  "mr",
+  "nb",
   "nl",
+  "nn",
   "pl",
+  "pt-PT",
   "pt-BR",
+  "ro",
   "ru",
+  "sk",
   "sl",
+  "sr",
   "sv",
+  "th",
   "tr",
   "uk",
   "vi",
   "zh-Hans",
   "zh-Hant",
-] as const;
+]);
 
 const fallbacks = {
   "zh-HK": ["zh-Hant", "en"],
@@ -40,11 +64,17 @@ const LazyImportPlugin: BackendModule = {
   read: function (language, _, callback) {
     const matchedLanguage = findNearestMatchedLanguage(language);
     import(`./locales/${matchedLanguage}.json`)
-      .then((translation: any) => {
-        callback(null, translation);
+      .then((translationModule: Record<string, unknown>) => {
+        callback(null, (translationModule.default as Record<string, unknown>) ?? translationModule);
       })
       .catch(() => {
-        // Fallback to English.
+        import("./locales/en.json")
+          .then((translationModule: Record<string, unknown>) => {
+            callback(null, (translationModule.default as Record<string, unknown>) ?? translationModule);
+          })
+          .catch((error: unknown) => {
+            callback(error as Error, false);
+          });
       });
   },
 };
@@ -55,6 +85,9 @@ i18n
   .init({
     detection: {
       order: ["navigator"],
+    },
+    interpolation: {
+      escapeValue: false,
     },
     fallbackLng: {
       ...fallbacks,

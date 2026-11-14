@@ -11,6 +11,7 @@ import (
 
 type IdentityProvider struct {
 	ID               int32
+	UID              string
 	Name             string
 	Type             storepb.IdentityProvider_Type
 	IdentifierFilter string
@@ -18,7 +19,8 @@ type IdentityProvider struct {
 }
 
 type FindIdentityProvider struct {
-	ID *int32
+	ID  *int32
+	UID *string
 }
 
 type UpdateIdentityProvider struct {
@@ -46,7 +48,6 @@ func (s *Store) CreateIdentityProvider(ctx context.Context, create *storepb.Iden
 	if err != nil {
 		return nil, err
 	}
-	s.idpCache.Store(identityProvider.Id, identityProvider)
 	return identityProvider, nil
 }
 
@@ -62,18 +63,12 @@ func (s *Store) ListIdentityProviders(ctx context.Context, find *FindIdentityPro
 		if err != nil {
 			return nil, err
 		}
-		s.idpCache.Store(identityProvider.Id, identityProvider)
+		identityProviders = append(identityProviders, identityProvider)
 	}
 	return identityProviders, nil
 }
 
 func (s *Store) GetIdentityProvider(ctx context.Context, find *FindIdentityProvider) (*storepb.IdentityProvider, error) {
-	if find.ID != nil {
-		if cache, ok := s.idpCache.Load(*find.ID); ok {
-			return cache.(*storepb.IdentityProvider), nil
-		}
-	}
-
 	list, err := s.ListIdentityProviders(ctx, find)
 	if err != nil {
 		return nil, err
@@ -82,7 +77,7 @@ func (s *Store) GetIdentityProvider(ctx context.Context, find *FindIdentityProvi
 		return nil, nil
 	}
 	if len(list) > 1 {
-		return nil, errors.Errorf("Found multiple identity providers with ID %d", *find.ID)
+		return nil, errors.New("found multiple identity providers")
 	}
 
 	identityProvider := list[0]
@@ -123,7 +118,6 @@ func (s *Store) UpdateIdentityProvider(ctx context.Context, update *UpdateIdenti
 	if err != nil {
 		return nil, err
 	}
-	s.idpCache.Store(identityProvider.Id, identityProvider)
 	return identityProvider, nil
 }
 
@@ -132,14 +126,13 @@ func (s *Store) DeleteIdentityProvider(ctx context.Context, delete *DeleteIdenti
 	if err != nil {
 		return err
 	}
-
-	s.idpCache.Delete(delete.ID)
 	return nil
 }
 
 func convertIdentityProviderFromRaw(raw *IdentityProvider) (*storepb.IdentityProvider, error) {
 	identityProvider := &storepb.IdentityProvider{
 		Id:               raw.ID,
+		Uid:              raw.UID,
 		Name:             raw.Name,
 		Type:             raw.Type,
 		IdentifierFilter: raw.IdentifierFilter,
@@ -155,6 +148,7 @@ func convertIdentityProviderFromRaw(raw *IdentityProvider) (*storepb.IdentityPro
 func convertIdentityProviderToRaw(identityProvider *storepb.IdentityProvider) (*IdentityProvider, error) {
 	raw := &IdentityProvider{
 		ID:               identityProvider.Id,
+		UID:              identityProvider.Uid,
 		Name:             identityProvider.Name,
 		Type:             identityProvider.Type,
 		IdentifierFilter: identityProvider.IdentifierFilter,

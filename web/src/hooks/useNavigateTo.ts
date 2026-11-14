@@ -1,18 +1,22 @@
-import { useNavigate } from "react-router-dom";
+import { useCallback } from "react";
+import { NavigateOptions, useNavigate } from "react-router-dom";
 
 const useNavigateTo = () => {
   const navigateTo = useNavigate();
 
-  const navigateToWithViewTransition = (to: string) => {
-    const document = window.document as any;
-    if (!document.startViewTransition) {
-      navigateTo(to);
-    } else {
-      document.startViewTransition(() => {
-        navigateTo(to);
-      });
-    }
-  };
+  const navigateToWithViewTransition = useCallback(
+    (to: string, options?: NavigateOptions) => {
+      const doc = window.document as unknown as Document & { startViewTransition?: (callback: () => void) => void };
+      if (!doc.startViewTransition) {
+        navigateTo(to, options);
+      } else {
+        document.startViewTransition(() => {
+          navigateTo(to, options);
+        });
+      }
+    },
+    [navigateTo],
+  );
 
   return navigateToWithViewTransition;
 };

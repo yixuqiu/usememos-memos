@@ -3,12 +3,11 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"log/slog"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 
-	"github.com/usememos/memos/server/profile"
+	"github.com/usememos/memos/internal/profile"
 	"github.com/usememos/memos/store"
 )
 
@@ -30,7 +29,7 @@ func NewDB(profile *profile.Profile) (store.Driver, error) {
 	driver := DB{profile: profile}
 	driver.config, err = mysql.ParseDSN(dsn)
 	if err != nil {
-		return nil, errors.New("Parse DSN eroor")
+		return nil, errors.New("Parse DSN error")
 	}
 
 	driver.db, err = sql.Open("mysql", dsn)
@@ -45,34 +44,29 @@ func (d *DB) GetDB() *sql.DB {
 	return d.db
 }
 
-func (d *DB) GetCurrentDBSize(ctx context.Context) (int64, error) {
-	query := "SELECT SUM(`data_length` + `index_length`) AS `size` " +
-		" FROM information_schema.TABLES" +
-		" WHERE `table_schema` = ?" +
-		" GROUP BY `table_schema`"
-	rows, err := d.db.QueryContext(ctx, query, d.config.DBName)
-	if err != nil {
-		slog.Error("Query db size error, make sure you have enough privilege", err)
-		return 0, err
-	}
-	defer rows.Close()
-
-	var size int64
-	for rows.Next() {
-		if err := rows.Scan(&size); err != nil {
-			return 0, err
-		}
-	}
-
-	if rows.Err() != nil {
-		return 0, rows.Err()
-	}
-
-	return size, nil
-}
-
 func (d *DB) Close() error {
 	return d.db.Close()
+}
+
+func (d *DB) IsInitialized(ctx context.Context) (bool, error) {
+	var exists bool
+	err := d.db.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memo' AND TABLE_TYPE = 'BASE TABLE')").Scan(&exists)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to check if database is initialized")
+	}
+	return exists, nil
+}
+
+// GetDatabaseSize returns the database size in bytes, or -1 if unavailable.
+func (d *DB) GetDatabaseSize(ctx context.Context) (int64, error) {
+	var size int64
+	const q = `SELECT COALESCE(SUM(data_length + index_length), 0)
+	           FROM information_schema.tables
+	           WHERE table_schema = DATABASE()`
+	if err := d.db.QueryRowContext(ctx, q).Scan(&size); err != nil {
+		return -1, errors.Wrap(err, "failed to query mysql database size")
+	}
+	return size, nil
 }
 
 func mergeDSN(baseDSN string) (string, error) {

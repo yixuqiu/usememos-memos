@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -59,8 +60,23 @@ func (d *DB) ListInboxes(ctx context.Context, find *store.FindInbox) ([]*store.I
 	if find.Status != nil {
 		where, args = append(where, "`status` = ?"), append(args, *find.Status)
 	}
+	if find.MessageType != nil {
+		// Filter by message type using JSON extraction
+		// Note: The type field in JSON is stored as string representation of the enum name
+		if *find.MessageType == storepb.InboxMessage_TYPE_UNSPECIFIED {
+			where, args = append(where, "(JSON_EXTRACT(`message`, '$.type') IS NULL OR JSON_EXTRACT(`message`, '$.type') = ?)"), append(args, find.MessageType.String())
+		} else {
+			where, args = append(where, "JSON_EXTRACT(`message`, '$.type') = ?"), append(args, find.MessageType.String())
+		}
+	}
 
 	query := "SELECT `id`, UNIX_TIMESTAMP(`created_ts`), `sender_id`, `receiver_id`, `status`, `message` FROM `inbox` WHERE " + strings.Join(where, " AND ") + " ORDER BY `created_ts` DESC"
+	if find.Limit != nil {
+		query = fmt.Sprintf("%s LIMIT %d", query, *find.Limit)
+		if find.Offset != nil {
+			query = fmt.Sprintf("%s OFFSET %d", query, *find.Offset)
+		}
+	}
 	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -103,7 +119,7 @@ func (d *DB) GetInbox(ctx context.Context, find *store.FindInbox) (*store.Inbox,
 		return nil, errors.Wrap(err, "failed to get inbox")
 	}
 	if len(list) != 1 {
-		return nil, errors.Wrapf(nil, "unexpected inbox count: %d", len(list))
+		return nil, errors.Errorf("unexpected inbox count: %d", len(list))
 	}
 	return list[0], nil
 }

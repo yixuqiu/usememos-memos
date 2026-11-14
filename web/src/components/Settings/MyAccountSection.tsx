@@ -1,58 +1,108 @@
-import { Button, Dropdown, Menu, MenuButton, MenuItem } from "@mui/joy";
-import { memoServiceClient } from "@/grpcweb";
-import { downloadFileFromUrl } from "@/helpers/utils";
+import { Button } from "@usememos/ui";
+import { KeyRoundIcon, PenLineIcon } from "lucide-react";
+import { useState } from "react";
+import ConfirmDialog from "@/components/ConfirmDialog";
+import { userServiceClient } from "@/connect";
+import { useAuth } from "@/contexts/AuthContext";
 import useCurrentUser from "@/hooks/useCurrentUser";
+import { useDialog } from "@/hooks/useDialog";
+import useNavigateTo from "@/hooks/useNavigateTo";
+import { handleError } from "@/lib/error";
+import { showErrorToast, toast } from "@/lib/toast";
+import { ROUTES } from "@/router/routes";
 import { useTranslate } from "@/utils/i18n";
-import showChangePasswordDialog from "../ChangePasswordDialog";
-import Icon from "../Icon";
-import showUpdateAccountDialog from "../UpdateAccountDialog";
+import ChangeMemberPasswordDialog from "../ChangeMemberPasswordDialog";
+import UpdateAccountDialog from "../UpdateAccountDialog";
 import UserAvatar from "../UserAvatar";
-import AccessTokenSection from "./AccessTokenSection";
+import LinkedIdentitySection from "./LinkedIdentitySection";
+import SettingGroup from "./SettingGroup";
+import SettingSection from "./SettingSection";
+import UsageSection from "./UsageSection";
+import UserStatsSection from "./UserStatsSection";
 
 const MyAccountSection = () => {
   const t = useTranslate();
   const user = useCurrentUser();
+  const { logout } = useAuth();
+  const navigateTo = useNavigateTo();
+  const accountDialog = useDialog();
+  const passwordDialog = useDialog();
+  const [deleteOpen, setDeleteOpen] = useState(false);
 
-  const downloadExportedMemos = async (user: any) => {
-    const { content } = await memoServiceClient.exportMemos({ filter: `creator == "${user.name}"` });
-    const downloadUrl = window.URL.createObjectURL(new Blob([content]));
-    downloadFileFromUrl(downloadUrl, "memos-export.zip");
-    URL.revokeObjectURL(downloadUrl);
+  const handleDeleteAccount = async () => {
+    if (!user?.name) {
+      return;
+    }
+    try {
+      await userServiceClient.deleteUser({ name: user.name });
+      await logout();
+      toast.add({ title: t("setting.member.delete-success", { username: user.username }), type: "success" });
+      navigateTo(ROUTES.AUTH, { replace: true });
+    } catch (error) {
+      handleError(error, showErrorToast, { context: "Delete account" });
+      throw error;
+    }
   };
 
   return (
-    <div className="w-full gap-2 pt-2 pb-4">
-      <p className="font-medium text-gray-700 dark:text-gray-500">{t("setting.account-section.title")}</p>
-      <div className="w-full mt-2 flex flex-row justify-start items-center">
-        <UserAvatar className="mr-2 shrink-0 w-10 h-10" avatarUrl={user.avatarUrl} />
-        <div className="max-w-[calc(100%-3rem)] flex flex-col justify-center items-start">
-          <p className="w-full">
-            <span className="text-xl leading-tight font-medium">{user.nickname}</span>
-            <span className="ml-1 text-base leading-tight text-gray-500 dark:text-gray-400">({user.username})</span>
-          </p>
-          <p className="w-4/5 leading-tight text-sm truncate">{user.description}</p>
-        </div>
-      </div>
-      <div className="w-full flex flex-row justify-start items-center mt-2 space-x-2">
-        <Button variant="outlined" color="neutral" size="sm" onClick={showUpdateAccountDialog}>
-          <Icon.PenLine className="w-4 h-4 mx-auto mr-1" />
-          {t("common.edit")}
-        </Button>
-        <Dropdown>
-          <MenuButton slots={{ root: "div" }}>
-            <Button variant="outlined" color="neutral" size="sm">
-              <Icon.MoreVertical className="w-4 h-4 mx-auto" />
+    <SettingSection title={t("setting.my-account.label")}>
+      <SettingGroup title={t("setting.account.title")}>
+        <div className="w-full flex flex-row flex-wrap justify-start items-center gap-3">
+          <UserAvatar className="shrink-0 w-12 h-12" avatarUrl={user?.avatarUrl} name={user?.displayName || user?.username} />
+          <div className="flex-1 min-w-40 flex flex-col justify-center items-start gap-1">
+            <div className="w-full">
+              <span className="mu-label">{user?.displayName}</span>
+              <span className="ml-2 mu-body text-mu-text-secondary">@{user?.username}</span>
+            </div>
+            {user?.description && <p className="w-full mu-body text-mu-text-secondary truncate">{user?.description}</p>}
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button variant="neutral" onClick={accountDialog.open} icon={<PenLineIcon />}>
+              {t("common.edit")}
             </Button>
-          </MenuButton>
-          <Menu className="text-sm" size="sm" placement="bottom">
-            <MenuItem onClick={showChangePasswordDialog}>{t("setting.account-section.change-password")}</MenuItem>
-            <MenuItem onClick={() => downloadExportedMemos(user)}>{t("setting.account-section.export-memos")}</MenuItem>
-          </Menu>
-        </Dropdown>
-      </div>
+            <Button variant="neutral" onClick={passwordDialog.open} icon={<KeyRoundIcon />}>
+              {t("setting.account.change-password")}
+            </Button>
+          </div>
+        </div>
+      </SettingGroup>
 
-      <AccessTokenSection />
-    </div>
+      <UserStatsSection />
+
+      <UsageSection />
+
+      <LinkedIdentitySection />
+
+      <SettingGroup showSeparator title={t("setting.account.danger-area")} description={t("setting.account.danger-area-description")}>
+        {/* A plain row: red is kept for the confirm step, not the section that leads to it. */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <p className="mu-label text-mu-text">{t("setting.account.delete-account")}</p>
+            <p className="mu-caption text-mu-text-secondary">{t("setting.account.delete-account-description")}</p>
+          </div>
+          <Button variant="neutral" className="shrink-0 self-start sm:self-auto" onClick={() => setDeleteOpen(true)}>
+            {t("setting.account.delete-account")}
+          </Button>
+        </div>
+      </SettingGroup>
+
+      {/* Update Account Dialog */}
+      <UpdateAccountDialog open={accountDialog.isOpen} onOpenChange={accountDialog.setOpen} />
+
+      {/* Change Password Dialog */}
+      <ChangeMemberPasswordDialog open={passwordDialog.isOpen} onOpenChange={passwordDialog.setOpen} user={user} />
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={user ? t("setting.member.delete-warning", { username: user.username }) : ""}
+        description={t("setting.member.delete-warning-description")}
+        confirmLabel={t("common.delete")}
+        cancelLabel={t("common.cancel")}
+        onConfirm={handleDeleteAccount}
+        confirmVariant="danger"
+      />
+    </SettingSection>
   );
 };
 

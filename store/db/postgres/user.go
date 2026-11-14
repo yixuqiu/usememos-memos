@@ -2,32 +2,63 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"slices"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/usememos/memos/store"
 )
 
 func (d *DB) CreateUser(ctx context.Context, create *store.User) (*store.User, error) {
-	fields := []string{"username", "role", "email", "nickname", "password_hash", "avatar_url"}
-	args := []any{create.Username, create.Role, create.Email, create.Nickname, create.PasswordHash, create.AvatarURL}
-	stmt := "INSERT INTO \"user\" (" + strings.Join(fields, ", ") + ") VALUES (" + placeholders(len(args)) + ") RETURNING id, avatar_url, description, created_ts, updated_ts, row_status"
-	if err := d.db.QueryRowContext(ctx, stmt, args...).Scan(
-		&create.ID,
-		&create.AvatarURL,
-		&create.Description,
-		&create.CreatedTs,
-		&create.UpdatedTs,
-		&create.RowStatus,
-	); err != nil {
+	return createUser(ctx, d.db, create)
+}
+
+// CreateUserTx is CreateUser within tx.
+func (*DB) CreateUserTx(ctx context.Context, tx *sql.Tx, create *store.User) (*store.User, error) {
+	return createUser(ctx, tx, create)
+}
+
+func createUser(ctx context.Context, q dbExecutor, create *store.User) (*store.User, error) {
+	if err := insertUser(ctx, q, create); err != nil {
 		return nil, err
 	}
-
 	return create, nil
 }
 
 func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.User, error) {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	user, err := updateUser(ctx, tx, update)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// UpdateUserTx is UpdateUser within tx.
+func (*DB) UpdateUserTx(ctx context.Context, tx *sql.Tx, update *store.UpdateUser) (*store.User, error) {
+	return updateUser(ctx, tx, update)
+}
+
+func updateUser(ctx context.Context, tx *sql.Tx, update *store.UpdateUser) (*store.User, error) {
+	if update.RemovesInstanceAdmin() {
+		if err := ensureInstanceAdminRetained(ctx, tx, update.ID); err != nil {
+			return nil, err
+		}
+	}
+	if update.RowStatus != nil && *update.RowStatus == store.Archived {
+		if err := validatePostgresUserArchive(ctx, tx, update.ID); err != nil {
+			return nil, err
+		}
+	}
 	set, args := []string{}, []any{}
 	if v := update.UpdatedTs; v != nil {
 		set, args = append(set, "updated_ts = "+placeholder(len(args)+1)), append(args, *v)
@@ -39,7 +70,7 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 		set, args = append(set, "username = "+placeholder(len(args)+1)), append(args, *v)
 	}
 	if v := update.Email; v != nil {
-		set, args = append(set, "email = "+placeholder(len(args)+1)), append(args, *v)
+		set, args = append(set, "email = "+placeholder(len(args)+1)), append(args, nullableEmail(*v))
 	}
 	if v := update.Nickname; v != nil {
 		set, args = append(set, "nickname = "+placeholder(len(args)+1)), append(args, *v)
@@ -53,6 +84,9 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 	if v := update.Description; v != nil {
 		set, args = append(set, "description = "+placeholder(len(args)+1)), append(args, *v)
 	}
+	if v := update.Role; v != nil {
+		set, args = append(set, "role = "+placeholder(len(args)+1)), append(args, *v)
+	}
 
 	query := `
 		UPDATE "user"
@@ -62,11 +96,12 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 	`
 	args = append(args, update.ID)
 	user := &store.User{}
-	if err := d.db.QueryRowContext(ctx, query, args...).Scan(
+	var email sql.NullString
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(
 		&user.ID,
 		&user.Username,
 		&user.Role,
-		&user.Email,
+		&email,
 		&user.Nickname,
 		&user.PasswordHash,
 		&user.AvatarURL,
@@ -77,15 +112,115 @@ func (d *DB) UpdateUser(ctx context.Context, update *store.UpdateUser) (*store.U
 	); err != nil {
 		return nil, err
 	}
-
+	user.Email = email.String
 	return user, nil
 }
 
+func validatePostgresUserArchive(ctx context.Context, tx *sql.Tx, userID int32) error {
+	var isLastActiveAdmin bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1
+		FROM "user" target_user
+		JOIN space_member target ON target.user_id = target_user.id
+			AND target.status = 'ACTIVE' AND target.role = 'ADMIN'
+		JOIN space ON space.id = target.space_id
+		WHERE target_user.id = $1
+			AND target_user.row_status = 'NORMAL'
+			AND NOT EXISTS (
+				SELECT 1
+				FROM space_member other
+				JOIN "user" other_user ON other_user.id = other.user_id
+				WHERE other.space_id = target.space_id
+					AND other.user_id <> target.user_id
+					AND other.status = 'ACTIVE'
+					AND other.role = 'ADMIN'
+					AND other_user.row_status = 'NORMAL'
+			)
+	)`, userID).Scan(&isLastActiveAdmin); err != nil {
+		return err
+	}
+	if isLastActiveAdmin {
+		return store.ErrLastSpaceAdmin
+	}
+	return nil
+}
+
+// ensureInstanceAdminRetained refuses a mutation that would remove the last
+// active instance administrator. The target's role is read first without a
+// lock so mutations of ordinary users skip the admin scan; for an active
+// admin every caller then locks the active admin rows in id order before
+// touching the target, so concurrent removals serialize instead of each
+// seeing the other admin as still active.
+func ensureInstanceAdminRetained(ctx context.Context, tx *sql.Tx, userID int32) error {
+	var role, rowStatus string
+	if err := tx.QueryRowContext(ctx, `SELECT role, row_status FROM "user" WHERE id = $1`, userID).Scan(&role, &rowStatus); errors.Is(err, sql.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if role != string(store.RoleAdmin) || rowStatus != string(store.Normal) {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM "user" WHERE role = 'ADMIN' AND row_status = 'NORMAL' ORDER BY id FOR UPDATE`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	adminCount := 0
+	for rows.Next() {
+		var id int32
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		adminCount++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if adminCount <= 1 {
+		return store.ErrLastInstanceAdmin
+	}
+	return nil
+}
+
 func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User, error) {
+	return listUsers(ctx, d.db, find)
+}
+
+// ListUsersTx is ListUsers within tx.
+func (*DB) ListUsersTx(ctx context.Context, tx *sql.Tx, find *store.FindUser) ([]*store.User, error) {
+	return listUsers(ctx, tx, find)
+}
+
+func listUsers(ctx context.Context, q dbExecutor, find *store.FindUser) ([]*store.User, error) {
 	where, args := []string{"1 = 1"}, []any{}
+	orderBy := []string{"created_ts DESC", "row_status DESC", "id DESC"}
+
+	if len(find.Filters) > 0 {
+		return nil, errors.Errorf("user filters are not supported")
+	}
 
 	if v := find.ID; v != nil {
 		where, args = append(where, "id = "+placeholder(len(args)+1)), append(args, *v)
+	}
+	if len(find.IDList) > 0 {
+		holders := make([]string, 0, len(find.IDList))
+		for range find.IDList {
+			holders = append(holders, placeholder(len(args)+1))
+			args = append(args, find.IDList[len(holders)-1])
+		}
+		where = append(where, fmt.Sprintf("id IN (%s)", strings.Join(holders, ", ")))
+	}
+	if len(find.UsernameList) > 0 {
+		holders := make([]string, 0, len(find.UsernameList))
+		for _, username := range find.UsernameList {
+			holders = append(holders, placeholder(len(args)+1))
+			args = append(args, username)
+		}
+		where = append(where, fmt.Sprintf("username IN (%s)", strings.Join(holders, ", ")))
+	}
+	if v := find.RowStatus; v != nil {
+		where, args = append(where, "row_status = "+placeholder(len(args)+1)), append(args, *v)
 	}
 	if v := find.Username; v != nil {
 		where, args = append(where, "username = "+placeholder(len(args)+1)), append(args, *v)
@@ -99,12 +234,19 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 	if v := find.Nickname; v != nil {
 		where, args = append(where, "nickname = "+placeholder(len(args)+1)), append(args, *v)
 	}
-
-	orderBy := []string{"created_ts DESC", "row_status DESC"}
-	if find.Random {
-		orderBy = slices.Concat([]string{"RANDOM()"}, orderBy)
+	if v := find.Search; v != nil && strings.TrimSpace(*v) != "" {
+		query := strings.ToLower(strings.TrimSpace(*v))
+		where, args = append(where, "(LOWER(username) LIKE "+placeholder(len(args)+1)+" OR LOWER(nickname) LIKE "+placeholder(len(args)+2)+")"), append(args, "%"+query+"%", "%"+query+"%")
+		orderBy = []string{
+			"CASE WHEN LOWER(username) = " + placeholder(len(args)+1) + " THEN 0 " +
+				"WHEN LOWER(username) LIKE " + placeholder(len(args)+2) + " THEN 1 " +
+				"WHEN LOWER(nickname) LIKE " + placeholder(len(args)+3) + " THEN 2 ELSE 3 END",
+			"LENGTH(username) ASC",
+			"created_ts DESC",
+			"row_status DESC",
+		}
+		args = append(args, query, query+"%", query+"%")
 	}
-
 	query := `
 		SELECT 
 			id,
@@ -122,8 +264,11 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY ` + strings.Join(orderBy, ", ")
 	if v := find.Limit; v != nil {
 		query += fmt.Sprintf(" LIMIT %d", *v)
+		if v := find.Offset; v != nil {
+			query += fmt.Sprintf(" OFFSET %d", *v)
+		}
 	}
-	rows, err := d.db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -132,11 +277,12 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 	list := make([]*store.User, 0)
 	for rows.Next() {
 		var user store.User
+		var email sql.NullString
 		if err := rows.Scan(
 			&user.ID,
 			&user.Username,
 			&user.Role,
-			&user.Email,
+			&email,
 			&user.Nickname,
 			&user.PasswordHash,
 			&user.AvatarURL,
@@ -147,6 +293,7 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 		); err != nil {
 			return nil, err
 		}
+		user.Email = email.String
 		list = append(list, &user)
 	}
 
@@ -157,13 +304,12 @@ func (d *DB) ListUsers(ctx context.Context, find *store.FindUser) ([]*store.User
 	return list, nil
 }
 
-func (d *DB) DeleteUser(ctx context.Context, delete *store.DeleteUser) error {
-	result, err := d.db.ExecContext(ctx, `DELETE FROM "user" WHERE id = $1`, delete.ID)
-	if err != nil {
-		return err
+// nullableEmail maps the store's "no address" value to SQL NULL. The email
+// column is nullable so the unique index ignores users without an address;
+// an empty string must never reach the table.
+func nullableEmail(email string) any {
+	if email == "" {
+		return nil
 	}
-	if _, err := result.RowsAffected(); err != nil {
-		return err
-	}
-	return nil
+	return email
 }

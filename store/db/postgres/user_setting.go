@@ -26,7 +26,7 @@ func (d *DB) UpsertUserSetting(ctx context.Context, upsert *store.UserSetting) (
 func (d *DB) ListUserSettings(ctx context.Context, find *store.FindUserSetting) ([]*store.UserSetting, error) {
 	where, args := []string{"1 = 1"}, []any{}
 
-	if v := find.Key; v != storepb.UserSettingKey_USER_SETTING_KEY_UNSPECIFIED {
+	if v := find.Key; v != storepb.UserSetting_KEY_UNSPECIFIED {
 		where, args = append(where, "key = "+placeholder(len(args)+1)), append(args, v.String())
 	}
 	if v := find.UserID; v != nil {
@@ -57,7 +57,7 @@ func (d *DB) ListUserSettings(ctx context.Context, find *store.FindUserSetting) 
 		); err != nil {
 			return nil, err
 		}
-		userSetting.Key = storepb.UserSettingKey(storepb.UserSettingKey_value[keyString])
+		userSetting.Key = storepb.UserSetting_Key(storepb.UserSetting_Key_value[keyString])
 		userSettingList = append(userSettingList, userSetting)
 	}
 
@@ -66,4 +66,78 @@ func (d *DB) ListUserSettings(ctx context.Context, find *store.FindUserSetting) 
 	}
 
 	return userSettingList, nil
+}
+
+func (d *DB) DeleteUserSettings(ctx context.Context, delete *store.DeleteUserSetting) error {
+	where, args := []string{"1 = 1"}, []any{}
+
+	if v := delete.Key; v != storepb.UserSetting_KEY_UNSPECIFIED {
+		where, args = append(where, "key = "+placeholder(len(args)+1)), append(args, v.String())
+	}
+	if v := delete.UserID; v != nil {
+		where, args = append(where, "user_id = "+placeholder(len(args)+1)), append(args, *v)
+	}
+
+	if _, err := d.db.ExecContext(ctx, "DELETE FROM user_setting WHERE "+strings.Join(where, " AND "), args...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DB) GetUserByPATHash(ctx context.Context, tokenHash string) (*store.PATQueryResult, error) {
+	// Fetch every PERSONAL_ACCESS_TOKENS row and match in Go. Filtering with
+	// PostgreSQL's JSON operators raises errors on rows whose value is not the
+	// expected shape, which would block every user's token at once.
+	query := `
+		SELECT
+			user_id,
+			value
+		FROM user_setting
+		WHERE key = 'PERSONAL_ACCESS_TOKENS'
+	`
+
+	rows, err := d.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Iterate through all users with PAT settings
+	for rows.Next() {
+		var userID int32
+		var tokensJSON string
+
+		if err := rows.Scan(&userID, &tokensJSON); err != nil {
+			return nil, err
+		}
+
+		// Only a row whose raw text carries the hash can match. Skipping the rest
+		// before decoding keeps one user's corrupt setting from blocking every
+		// other user's token, while a corrupt row that does carry the hash surfaces
+		// as an error instead of a miss.
+		if !strings.Contains(tokensJSON, tokenHash) {
+			continue
+		}
+
+		patsUserSetting := &storepb.PersonalAccessTokensUserSetting{}
+		if err := protojsonUnmarshaler.Unmarshal([]byte(tokensJSON), patsUserSetting); err != nil {
+			return nil, err
+		}
+
+		// Search for matching token hash
+		for _, pat := range patsUserSetting.Tokens {
+			if pat.TokenHash == tokenHash {
+				return &store.PATQueryResult{
+					UserID: userID,
+					PAT:    pat,
+				}, nil
+			}
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }

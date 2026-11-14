@@ -1,58 +1,83 @@
-<img height="56px" src="https://www.usememos.com/full-logo-landscape.png" alt="Memos" />
+> ✨ Featured sponsor: [CodeRabbit — Industry-leading AI code reviews](https://coderabbit.link/usememos).
 
-A privacy-first, lightweight note-taking service. Easily capture and share your great thoughts.
+<h1 id="memos">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/brand/lockup-on-dark.svg" />
+    <img src="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/brand/lockup.svg" alt="Memos" width="220" />
+  </picture>
+</h1>
 
-<a href="https://www.usememos.com">Home Page</a> •
-<a href="https://www.usememos.com/blog">Blogs</a> •
-<a href="https://www.usememos.com/docs">Docs</a> •
-<a href="https://demo.usememos.com/">Live Demo</a>
+### Simple note-taking for your everyday thoughts.
 
-<p>
-  <a href="https://hub.docker.com/r/neosmemo/memos"><img alt="Docker pull" src="https://img.shields.io/docker/pulls/neosmemo/memos.svg"/></a>
-  <a href="https://discord.gg/tfPJa4UmAv"><img alt="Discord" src="https://img.shields.io/badge/discord-chat-5865f2?logo=discord&logoColor=f5f5f5" /></a>
-</p>
+Memos is an open-source, self-hosted note-taking app that brings your everyday thoughts together in a personal timeline. Your data stays yours, and you choose what to keep private or share.
 
-![demo](https://www.usememos.com/demo.png)
+[Demo](https://demo.usememos.com) · [Install](#quick-start) · [Docs](https://usememos.com/docs) · [Discord](https://discord.gg/tfPJa4UmAv)
 
-## Key points
+[![Docker pulls](https://img.shields.io/docker/pulls/neosmemo/memos?style=flat-square&logo=docker)](https://hub.docker.com/r/neosmemo/memos)
+[![Latest release](https://img.shields.io/github/v/release/usememos/memos?style=flat-square&label=Release)](https://github.com/usememos/memos/releases)
 
-- **Open source and free forever**. Embrace a future where creativity knows no boundaries with our open-source solution – free today, tomorrow, and always.
-- **Self-hosting with Docker in just seconds**. Enjoy the flexibility, scalability, and ease of setup that Docker provides, allowing you to have full control over your data and privacy.
-- **Pure text with added Markdown support.** Say goodbye to the overwhelming mental burden of rich formatting and embrace a minimalist approach.
-- **Customize and share your notes effortlessly**. With our intuitive sharing features, you can easily collaborate and distribute your notes with others.
-- **RESTful API for third-party services.** Embrace the power of integration and unleash new possibilities with our RESTful API support.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/previews/timeline-dark.png" />
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/previews/timeline-light.png" />
+  <img src="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/previews/timeline-light.png" alt="The Memos timeline with a memo composer and recent memos" />
+</picture>
 
-## Deploy with Docker in seconds
+## About Memos
+
+Memos is an open-source, self-hosted note-taking app for your everyday thoughts.
+
+- **Everyday writing.** A single sentence can be a whole memo, or you can take your time with a longer entry, using Markdown to give your words more structure.
+- **A personal timeline.** Each memo stays with the day you wrote it, bringing your thoughts together in a timeline you can look back through. Tags connect related thoughts across those days, making it easy to pick up a topic again or find something you remember writing.
+- **Your own data.** Your record lives on your own server, and your data stays yours.
+- **Sharing you control.** You choose what stays private, what to share with family and friends, and what to publish on the web. In shared spaces, you can write alongside others while each person keeps their own memos.
+
+## Quick start
+
+With Docker installed, run:
 
 ```bash
-docker run -d --name memos -p 5230:5230 -v ~/.memos/:/var/opt/memos neosmemo/memos:stable
+docker run -d \
+  --name memos \
+  -p 5230:5230 \
+  -v ~/.memos:/var/opt/memos \
+  neosmemo/memos:stable
 ```
 
-> The `~/.memos/` directory will be used as the data directory on your local machine, while `/var/opt/memos` is the directory of the volume in Docker and should not be modified.
+Open http://localhost:5230 and create the first account. Everything Memos keeps is in `~/.memos`, so back up that one folder.
 
-Learn more about [other installation methods](https://www.usememos.com/docs/install).
+Other ways to run Memos, including Docker Compose, Kubernetes, and a plain binary, are in the [deployment guide](https://usememos.com/docs/deploy).
 
-## Contribution
+## Upgrading
 
-Contributions are what make the open-source community such an amazing place to learn, inspire, and create. We greatly appreciate any contributions you make. Thank you for being a part of our community! 🥰
+Releases are tagged `YY.MM.N`, with release candidates as `YY.MM.N-rc.K` and no `v` prefix. The Docker tag `stable` follows stable releases, a month tag such as `26.10` follows the newest stable release of that month, and `canary` follows development builds. Coming from a release before v0.31.0, run [v0.31.0](https://github.com/usememos/memos/releases/tag/v0.31.0) once first; see the [upgrade requirements](store/migration/README.md).
 
-<a href="https://github.com/usememos/memos/graphs/contributors">
-  <img src="https://contri-graphy.yourselfhosted.com/graph?repo=usememos/memos&format=svg" />
-</a>
+## Around Memos
 
-## Internationalization
+- [Web Clipper](https://usememos.com/web-clipper) for [Chrome](https://chromewebstore.google.com/detail/memos-web-clipper/nebaoebnljalfegiidibihhkebeiklbl) and [Firefox](https://addons.mozilla.org/en-US/firefox/addon/memos-web-clipper/) saves pages, selections, and images to your memos as Markdown with a link to the source.
+- [Memogram](https://github.com/usememos/telegram-integration) is a Telegram bot that saves your messages and images to Memos.
+- The [API](https://usememos.com/docs/api/latest) and [MCP server](https://usememos.com/docs/integrations/mcp) connect Memos to your own scripts and AI tools.
 
-Memos supports multiple languages. You can help us translate Memos into your language. We use Weblate to manage translations.
+## Sponsors
 
-<a href="https://hosted.weblate.org/engage/memos-i18n/">
-<img src="https://hosted.weblate.org/widget/memos-i18n/english/287x66-grey.png" alt="Translation status" />
-</a>
+<p>
+  <a href="https://coderabbit.link/usememos" target="_blank" rel="noopener"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/sponsors/coderabbit/white-typemark.svg" /><img src="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/sponsors/coderabbit/orange-typemark.svg" alt="CodeRabbit" height="40" align="middle" /></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.testmuai.com/?utm_medium=sponsor&utm_source=memos" target="_blank" rel="noopener"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/sponsors/testmuai/white.png" /><img src="https://raw.githubusercontent.com/usememos/.github/refs/heads/main/assets/sponsors/testmuai/black.png" alt="TestMu AI" height="30" align="middle" /></picture></a>
+</p>
 
-## Star history
+Sponsor Memos through [GitHub Sponsors](https://github.com/sponsors/usememos).
 
-[![Star History Chart](https://api.star-history.com/svg?repos=usememos/memos&type=Date)](https://star-history.com/#usememos/memos&Date)
+## Help and contributing
 
-## Other projects
+Questions go to the [docs](https://usememos.com/docs), [Discord](https://discord.gg/tfPJa4UmAv), or [GitHub Discussions](https://github.com/usememos/memos/discussions). Bugs and ideas go to [issues](https://github.com/usememos/memos/issues/new/choose). Code changes start with the [contributing guide](https://usememos.com/docs/development/contributing).
 
-- [**Slash**](https://github.com/yourselfhosted/slash): An open source, self-hosted bookmarks and link sharing platform. Save and share your links very easily.
-- [**Gomark**](https://github.com/yourselfhosted/gomark): A markdown parser written in Go for Memos. And its [WebAssembly version](https://github.com/yourselfhosted/gomark-wasm) is also available.
+## Star History
+
+<p>
+  <a href="https://www.star-history.com/usememos/memos"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=usememos/memos&type=rank&theme=dark" /><source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=usememos/memos&type=rank" /><img alt="Star History Rank" src="https://api.star-history.com/badge?repo=usememos/memos&type=rank" /></picture></a>
+  <a href="https://www.star-history.com/usememos/memos"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=usememos/memos&type=trending&theme=dark" /><source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=usememos/memos&type=trending" /><img alt="GitHub Trending Repository of the Day" src="https://api.star-history.com/badge?repo=usememos/memos&type=trending" /></picture></a>
+</p>
+
+## License
+
+Memos is open source under the [MIT License](LICENSE).

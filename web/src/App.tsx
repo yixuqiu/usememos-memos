@@ -1,125 +1,82 @@
-import { useColorScheme } from "@mui/joy";
+import { DirectionProvider } from "@base-ui/react/direction-provider";
 import { useEffect } from "react";
-import { useTranslation } from "react-i18next";
-import { Outlet } from "react-router-dom";
-import useLocalStorage from "react-use/lib/useLocalStorage";
-import { getSystemColorScheme } from "./helpers/utils";
+import { Outlet, ScrollRestoration } from "react-router-dom";
+import { useInstance } from "./contexts/InstanceContext";
+import { TimelineViewProvider } from "./contexts/ViewContext";
 import useNavigateTo from "./hooks/useNavigateTo";
-import { useCommonContext } from "./layouts/CommonContextProvider";
-import { useUserStore, useWorkspaceSettingStore } from "./store/v1";
-import { WorkspaceGeneralSetting, WorkspaceSettingKey } from "./types/proto/store/workspace_setting";
+import { useUserLocale } from "./hooks/useUserLocale";
+import { useUserTheme } from "./hooks/useUserTheme";
+import { DEFAULT_FAVICON, getCustomLogoUrl } from "./lib/branding";
+import { cleanupExpiredOAuthState } from "./utils/oauth";
 
 const App = () => {
-  const { i18n } = useTranslation();
   const navigateTo = useNavigateTo();
-  const { mode, setMode } = useColorScheme();
-  const workspaceSettingStore = useWorkspaceSettingStore();
-  const userStore = useUserStore();
-  const commonContext = useCommonContext();
-  const [, setLocale] = useLocalStorage("locale", "en");
-  const [, setAppearance] = useLocalStorage("appearance", "system");
-  const workspaceProfile = commonContext.profile;
-  const userSetting = userStore.userSetting;
+  const { profile: instanceProfile, profileLoaded, generalSetting: instanceGeneralSetting } = useInstance();
 
-  const workspaceGeneralSetting =
-    workspaceSettingStore.getWorkspaceSettingByKey(WorkspaceSettingKey.WORKSPACE_SETTING_GENERAL).generalSetting ||
-    WorkspaceGeneralSetting.fromPartial({});
+  // Apply user preferences reactively
+  const direction = useUserLocale();
+  useUserTheme();
 
-  // Redirect to sign up page if no instance owner.
+  // Clean up expired OAuth states on app initialization
   useEffect(() => {
-    if (!workspaceProfile.owner) {
-      navigateTo("/auth/signup");
-    }
-  }, [workspaceProfile.owner]);
-
-  useEffect(() => {
-    const darkMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const handleColorSchemeChange = (e: MediaQueryListEvent) => {
-      if (commonContext.appearance === "system") {
-        const mode = e.matches ? "dark" : "light";
-        setMode(mode);
-      }
-    };
-
-    try {
-      if (darkMediaQuery.addEventListener) {
-        darkMediaQuery.addEventListener("change", handleColorSchemeChange);
-      } else {
-        darkMediaQuery.addListener(handleColorSchemeChange);
-      }
-    } catch (error) {
-      console.error("failed to initial color scheme listener", error);
-    }
+    cleanupExpiredOAuthState();
   }, []);
 
+  // Redirect to sign up page if the instance needs initial setup (no users yet).
+  // needsSetup is used instead of a missing admin so an instance that has lost its
+  // admins isn't mistaken for a fresh install (which would create a normal user).
+  // Guard with profileLoaded so a fetch failure doesn't incorrectly trigger the redirect.
   useEffect(() => {
-    if (workspaceGeneralSetting.additionalStyle) {
+    if (profileLoaded && instanceProfile.needsSetup) {
+      navigateTo("/auth/signup");
+    }
+  }, [profileLoaded, instanceProfile.needsSetup, navigateTo]);
+
+  useEffect(() => {
+    if (instanceGeneralSetting.additionalStyle) {
       const styleEl = document.createElement("style");
-      styleEl.innerHTML = workspaceGeneralSetting.additionalStyle;
+      styleEl.innerHTML = instanceGeneralSetting.additionalStyle;
       styleEl.setAttribute("type", "text/css");
       document.body.insertAdjacentElement("beforeend", styleEl);
     }
-  }, [workspaceGeneralSetting.additionalStyle]);
+  }, [instanceGeneralSetting.additionalStyle]);
 
   useEffect(() => {
-    if (workspaceGeneralSetting.additionalScript) {
+    if (instanceGeneralSetting.additionalScript) {
       const scriptEl = document.createElement("script");
-      scriptEl.innerHTML = workspaceGeneralSetting.additionalScript;
+      scriptEl.innerHTML = instanceGeneralSetting.additionalScript;
       document.head.appendChild(scriptEl);
     }
-  }, [workspaceGeneralSetting.additionalScript]);
+  }, [instanceGeneralSetting.additionalScript]);
 
-  // Dynamic update metadata with customized profile.
+  // Dynamic update metadata with customized profile
   useEffect(() => {
-    if (!workspaceGeneralSetting.customProfile) {
+    const customProfile = instanceGeneralSetting.customProfile;
+    document.title = customProfile?.title || "Memos";
+    const link = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+    if (!link) return;
+
+    const logoUrl = getCustomLogoUrl(customProfile?.logoUrl);
+    if (logoUrl) {
+      link.href = logoUrl;
+      // Custom images may be PNG, JPEG, or SVG; let the browser detect their type.
+      link.removeAttribute("type");
       return;
     }
 
-    document.title = workspaceGeneralSetting.customProfile.title;
-    const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-    link.href = workspaceGeneralSetting.customProfile.logoUrl || "/logo.webp";
-  }, [workspaceGeneralSetting.customProfile]);
+    // A fixed blue stays visible when browser chrome differs from the system theme.
+    link.href = DEFAULT_FAVICON;
+    link.type = "image/svg+xml";
+  }, [instanceGeneralSetting.customProfile]);
 
-  useEffect(() => {
-    const currentLocale = commonContext.locale;
-    i18n.changeLanguage(currentLocale);
-    document.documentElement.setAttribute("lang", currentLocale);
-    if (currentLocale === "ar") {
-      document.documentElement.setAttribute("dir", "rtl");
-    } else {
-      document.documentElement.setAttribute("dir", "ltr");
-    }
-    setLocale(currentLocale);
-  }, [commonContext.locale]);
-
-  useEffect(() => {
-    let currentAppearance = commonContext.appearance as Appearance;
-    if (currentAppearance === "system") {
-      currentAppearance = getSystemColorScheme();
-    }
-    setMode(currentAppearance);
-    setAppearance(currentAppearance);
-  }, [commonContext.appearance]);
-
-  useEffect(() => {
-    const root = document.documentElement;
-    if (mode === "light") {
-      root.classList.remove("dark");
-    } else if (mode === "dark") {
-      root.classList.add("dark");
-    }
-  }, [mode]);
-
-  useEffect(() => {
-    if (!userSetting) {
-      return;
-    }
-
-    commonContext.setLocale(userSetting.locale);
-    commonContext.setAppearance(userSetting.appearance);
-  }, [userSetting?.locale, userSetting?.appearance]);
-
-  return <Outlet />;
+  return (
+    <DirectionProvider direction={direction}>
+      <TimelineViewProvider>
+        <Outlet />
+      </TimelineViewProvider>
+      <ScrollRestoration />
+    </DirectionProvider>
+  );
 };
 
 export default App;

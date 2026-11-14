@@ -1,38 +1,59 @@
 name: Bug Report
-description: If something isn't working as expected
-labels: [bug]
+description: Report something that is not working as expected
+type: Bug
 body:
   - type: markdown
     attributes:
       value: |
-        Before submitting a bug report, please check if the issue is already present in the issues. If it is, please add a reaction to the issue. If it isn't, please fill out the form below.
+        Thanks for reporting a bug.
+
+        Before submitting, please search [existing issues](https://github.com/usememos/memos/issues) and, if possible, check the [latest release](https://github.com/usememos/memos/releases/latest). For questions and setup help, use [Discussions](https://github.com/usememos/memos/discussions).
+
+  - type: checkboxes
+    id: pre-check
+    attributes:
+      label: Check before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate
+          required: true
+
   - type: textarea
+    id: description
     attributes:
       label: Describe the bug
-      description: |
-        Briefly describe the problem you are having in a few paragraphs.
+      description: Tell us what happened and what you expected instead.
+      placeholder: |
+        What happened:
+        What I expected:
     validations:
       required: true
+
   - type: textarea
+    id: reproduction-steps
     attributes:
       label: Steps to reproduce
-      description: |
-        Provide the steps to reproduce the issue.
+      description: Give us the shortest steps that reproduce the problem.
       placeholder: |
-        1. Go to '...'
-        2. Click on '....'
-        3. See error
+        1. Go to ...
+        2. Click ...
+        3. See ...
     validations:
       required: true
+
   - type: input
+    id: version
     attributes:
-      label: The version of Memos you're using
-      description: |
-        Provide the version of Memos you're using.
+      label: Memos version
+      description: Use the version from Settings > System, the image tag, or `memos --version`.
+      placeholder: "v0.29.x or main@abcdef"
     validations:
       required: true
+
   - type: textarea
+    id: additional-context
     attributes:
-      label: Screenshots or additional context
-      description: |
-        If applicable, add screenshots to help explain your problem. And add any other context about the problem here. Such as the device you're using, etc.
+      label: Additional context
+      description: Add relevant deployment details, logs, screenshots, or recordings. Remove secrets before submitting.
+      placeholder: |
+        Deployment / database / browser:
+        Logs or screenshots:

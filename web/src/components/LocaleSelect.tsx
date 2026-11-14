@@ -1,50 +1,24 @@
-import { Option, Select } from "@mui/joy";
 import { FC } from "react";
-import { locales } from "@/i18n";
-import Icon from "./Icon";
+import LocalePicker from "@/components/LocalePicker";
+import { loadLocale } from "@/utils/i18n";
 
 interface Props {
   value: Locale;
-  className?: string;
   onChange: (locale: Locale) => void;
+  className?: string;
 }
 
 const LocaleSelect: FC<Props> = (props: Props) => {
-  const { onChange, value, className } = props;
+  const { className, onChange, value } = props;
 
   const handleSelectChange = async (locale: Locale) => {
+    // Apply locale globally immediately
+    loadLocale(locale);
+    // Also notify parent component
     onChange(locale);
   };
 
-  return (
-    <Select
-      className={`!min-w-[10rem] w-auto whitespace-nowrap ${className ?? ""}`}
-      startDecorator={<Icon.Globe className="w-4 h-auto" />}
-      value={value}
-      onChange={(_, value) => handleSelectChange(value as Locale)}
-    >
-      {locales.map((locale) => {
-        try {
-          const languageName = new Intl.DisplayNames([locale], { type: "language" }).of(locale);
-          if (languageName) {
-            return (
-              <Option key={locale} value={locale}>
-                {languageName.charAt(0).toUpperCase() + languageName.slice(1)}
-              </Option>
-            );
-          }
-        } catch (error) {
-          // do nth
-        }
-
-        return (
-          <Option key={locale} value={locale}>
-            {locale}
-          </Option>
-        );
-      })}
-    </Select>
-  );
+  return <LocalePicker value={value} onChange={handleSelectChange} className={className} />;
 };
 
 export default LocaleSelect;

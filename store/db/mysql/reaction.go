@@ -2,49 +2,76 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 
 	"github.com/pkg/errors"
 
-	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
 
 func (d *DB) UpsertReaction(ctx context.Context, upsert *store.Reaction) (*store.Reaction, error) {
-	fields := []string{"`creator_id`", "`content_id`", "`reaction_type`"}
-	placeholder := []string{"?", "?", "?"}
-	args := []interface{}{upsert.CreatorID, upsert.ContentID, upsert.ReactionType.String()}
-	stmt := "INSERT INTO `reaction` (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ")"
-	result, err := d.db.ExecContext(ctx, stmt, args...)
+	// MySQL has no INSERT ... RETURNING, so keep the insert and readback in one
+	// transaction to match the other drivers' atomic operation.
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to start reaction upsert transaction")
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if upsert.Policy != nil {
+		if err := validateMySQLReactionWritePolicy(ctx, tx, upsert); err != nil {
+			return nil, err
+		}
 	}
 
-	rawID, err := result.LastInsertId()
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO reaction (creator_id, memo_id, reaction_type)
+		SELECT ?, memo.id, ?
+		FROM memo
+		WHERE memo.id = ?
+		LOCK IN SHARE MODE
+		ON DUPLICATE KEY UPDATE id = reaction.id
+	`, upsert.CreatorID, upsert.ReactionType, upsert.MemoID)
 	if err != nil {
 		return nil, err
 	}
-	id := int32(rawID)
-	reaction, err := d.GetReaction(ctx, &store.FindReaction{ID: &id})
-	if err != nil {
-		return nil, err
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id, UNIX_TIMESTAMP(created_ts) FROM reaction
+		WHERE creator_id = ? AND memo_id = ? AND reaction_type = ?
+	`, upsert.CreatorID, upsert.MemoID, upsert.ReactionType).Scan(&upsert.ID, &upsert.CreatedTs); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errors.Wrap(store.ErrReactionMemoNotFound, "failed to create reaction")
+		}
+		return nil, errors.Wrap(err, "failed to read reaction")
 	}
-	if reaction == nil {
-		return nil, errors.Errorf("failed to create reaction")
+
+	if err := tx.Commit(); err != nil {
+		return nil, errors.Wrap(err, "failed to commit reaction upsert transaction")
 	}
-	return reaction, nil
+	return upsert, nil
 }
 
 func (d *DB) ListReactions(ctx context.Context, find *store.FindReaction) ([]*store.Reaction, error) {
-	where, args := []string{"1 = 1"}, []interface{}{}
+	where, args := []string{"1 = 1"}, []any{}
+
 	if find.ID != nil {
 		where, args = append(where, "`id` = ?"), append(args, *find.ID)
 	}
 	if find.CreatorID != nil {
 		where, args = append(where, "`creator_id` = ?"), append(args, *find.CreatorID)
 	}
-	if find.ContentID != nil {
-		where, args = append(where, "`content_id` = ?"), append(args, *find.ContentID)
+	if find.MemoID != nil {
+		where, args = append(where, "`memo_id` = ?"), append(args, *find.MemoID)
+	}
+	if len(find.MemoIDList) > 0 {
+		placeholders := make([]string, 0, len(find.MemoIDList))
+		for _, id := range find.MemoIDList {
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+		where = append(where, "`memo_id` IN ("+strings.Join(placeholders, ",")+")")
 	}
 
 	rows, err := d.db.QueryContext(ctx, `
@@ -52,7 +79,7 @@ func (d *DB) ListReactions(ctx context.Context, find *store.FindReaction) ([]*st
 			id,
 			UNIX_TIMESTAMP(created_ts) AS created_ts,
 			creator_id,
-			content_id,
+			memo_id,
 			reaction_type
 		FROM reaction
 		WHERE `+strings.Join(where, " AND ")+`
@@ -67,17 +94,15 @@ func (d *DB) ListReactions(ctx context.Context, find *store.FindReaction) ([]*st
 	list := []*store.Reaction{}
 	for rows.Next() {
 		reaction := &store.Reaction{}
-		var reactionType string
 		if err := rows.Scan(
 			&reaction.ID,
 			&reaction.CreatedTs,
 			&reaction.CreatorID,
-			&reaction.ContentID,
-			&reactionType,
+			&reaction.MemoID,
+			&reaction.ReactionType,
 		); err != nil {
 			return nil, err
 		}
-		reaction.ReactionType = storepb.ReactionType(storepb.ReactionType_value[reactionType])
 		list = append(list, reaction)
 	}
 
@@ -102,6 +127,59 @@ func (d *DB) GetReaction(ctx context.Context, find *store.FindReaction) (*store.
 }
 
 func (d *DB) DeleteReaction(ctx context.Context, delete *store.DeleteReaction) error {
-	_, err := d.db.ExecContext(ctx, "DELETE FROM `reaction` WHERE `id` = ?", delete.ID)
+	if delete.ActorUserID != nil {
+		return d.deleteReactionAsCreator(ctx, delete)
+	}
+	where, args := []string{}, []any{}
+	if delete.ID != nil {
+		where, args = append(where, "`id` = ?"), append(args, *delete.ID)
+	}
+	if delete.MemoID != nil {
+		where, args = append(where, "`memo_id` = ?"), append(args, *delete.MemoID)
+	}
+	if len(where) == 0 {
+		return nil
+	}
+
+	_, err := d.db.ExecContext(ctx, "DELETE FROM `reaction` WHERE "+strings.Join(where, " AND "), args...)
 	return err
+}
+
+func (d *DB) deleteReactionAsCreator(ctx context.Context, delete *store.DeleteReaction) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to begin authorized reaction delete transaction")
+	}
+	defer func() { _ = tx.Rollback() }()
+	actorIsAdmin := false
+	if delete.Policy != nil {
+		participation, err := validateMySQLReactionDeletePolicy(ctx, tx, &store.Reaction{
+			CreatorID: *delete.ActorUserID,
+			MemoID:    *delete.MemoID,
+			Policy:    delete.Policy,
+		})
+		if err != nil {
+			return err
+		}
+		actorIsAdmin = participation.Actor.Admin
+	}
+
+	var creatorID, memoID int32
+	if err := tx.QueryRowContext(ctx, "SELECT creator_id, memo_id FROM reaction WHERE id = ?", *delete.ID).Scan(&creatorID, &memoID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return errors.Wrap(err, "failed to read reaction for deletion")
+	}
+	// An instance administrator may withdraw any reaction on the named memo.
+	if (creatorID != *delete.ActorUserID && !actorIsAdmin) || (delete.MemoID != nil && memoID != *delete.MemoID) {
+		return store.ErrReactionPermissionDenied
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM reaction WHERE id = ?", *delete.ID); err != nil {
+		return errors.Wrap(err, "failed to delete reaction")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit authorized reaction delete transaction")
+	}
+	return nil
 }

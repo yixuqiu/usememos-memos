@@ -1,121 +1,67 @@
-import { Option, Select } from "@mui/joy";
-import { LucideIcon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
-import Icon from "@/components/Icon";
-import MobileHeader from "@/components/MobileHeader";
-import MemberSection from "@/components/Settings/MemberSection";
-import MyAccountSection from "@/components/Settings/MyAccountSection";
-import PreferencesSection from "@/components/Settings/PreferencesSection";
-import SSOSection from "@/components/Settings/SSOSection";
-import SectionMenuItem from "@/components/Settings/SectionMenuItem";
-import StorageSection from "@/components/Settings/StorageSection";
-import WorkspaceSection from "@/components/Settings/WorkspaceSection";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
+import {
+  DEFAULT_SETTING_SECTION,
+  isSettingSectionKey,
+  SETTINGS_SECTIONS,
+  type SettingSectionKey,
+} from "@/components/Settings/settingSections";
+import { useInstance } from "@/contexts/InstanceContext";
 import useCurrentUser from "@/hooks/useCurrentUser";
-import { useCommonContext } from "@/layouts/CommonContextProvider";
-import { User_Role } from "@/types/proto/api/v1/user_service";
-import { useTranslate } from "@/utils/i18n";
-
-type SettingSection = "my-account" | "preference" | "member" | "system" | "storage" | "sso";
-
-interface State {
-  selectedSection: SettingSection;
-}
-
-const BASIC_SECTIONS: SettingSection[] = ["my-account", "preference"];
-const ADMIN_SECTIONS: SettingSection[] = ["member", "system", "storage", "sso"];
-const SECTION_ICON_MAP: Record<SettingSection, LucideIcon> = {
-  "my-account": Icon.User,
-  preference: Icon.Cog,
-  member: Icon.Users,
-  system: Icon.Settings2,
-  storage: Icon.Database,
-  sso: Icon.Key,
-};
+import { User_Role } from "@/types/proto/api/user_service_pb";
 
 const Setting = () => {
-  const t = useTranslate();
-  const commonContext = useCommonContext();
+  const location = useLocation();
   const user = useCurrentUser();
-  const [state, setState] = useState<State>({
-    selectedSection: "my-account",
-  });
+  const { fetchSettings } = useInstance();
+  const [selectedSection, setSelectedSection] = useState<SettingSectionKey>(DEFAULT_SETTING_SECTION);
+  const isHost = user?.role === User_Role.ADMIN;
 
-  const isHost = user.role === User_Role.HOST;
-
-  const settingsSectionList = useMemo(() => {
-    let settingList = [...BASIC_SECTIONS];
-    if (isHost) {
-      settingList = settingList.concat(ADMIN_SECTIONS);
-    }
-    return settingList;
+  const sectionGroups = useMemo(() => {
+    const visibleSections = SETTINGS_SECTIONS.filter((section) => section.scope === "basic" || isHost);
+    return {
+      admin: visibleSections.filter((section) => section.scope === "admin"),
+      all: visibleSections,
+    };
   }, [isHost]);
 
-  const handleSectionSelectorItemClick = useCallback((settingSection: SettingSection) => {
-    setState({
-      selectedSection: settingSection,
-    });
-  }, []);
+  const visibleSectionKeys = useMemo(() => new Set(sectionGroups.all.map((section) => section.key)), [sectionGroups.all]);
+
+  useEffect(() => {
+    const hash = location.hash.slice(1);
+    const nextSection = isSettingSectionKey(hash) && visibleSectionKeys.has(hash) ? hash : DEFAULT_SETTING_SECTION;
+    setSelectedSection(nextSection);
+  }, [location.hash, visibleSectionKeys]);
+
+  // Jump back to the top when switching sections; skip the initial hash sync so
+  // scroll restoration on back-navigation still wins.
+  const prevSectionRef = useRef<SettingSectionKey | null>(null);
+  useEffect(() => {
+    if (prevSectionRef.current && prevSectionRef.current !== selectedSection) {
+      window.scrollTo({ top: 0 });
+    }
+    prevSectionRef.current = selectedSection;
+  }, [selectedSection]);
+
+  useEffect(() => {
+    if (!isHost) {
+      return;
+    }
+    const preloadSettingKeys = new Set(sectionGroups.admin.flatMap((section) => section.preloadSettingKeys ?? []));
+    void fetchSettings([...preloadSettingKeys]);
+  }, [fetchSettings, isHost, sectionGroups.admin]);
+
+  const selectedSectionDefinition =
+    sectionGroups.all.find((section) => section.key === selectedSection) ??
+    SETTINGS_SECTIONS.find((section) => section.key === DEFAULT_SETTING_SECTION) ??
+    SETTINGS_SECTIONS[0];
+  const ActiveSection = selectedSectionDefinition.component;
 
   return (
-    <section className="@container w-full max-w-5xl min-h-full flex flex-col justify-start items-start sm:pt-3 md:pt-6 pb-8">
-      <MobileHeader />
-      <div className="w-full px-4 sm:px-6">
-        <div className="w-full shadow flex flex-row justify-start items-start px-4 py-3 rounded-xl bg-white dark:bg-zinc-800 text-gray-600 dark:text-gray-400">
-          <div className="hidden sm:flex flex-col justify-start items-start w-40 h-auto shrink-0 py-2">
-            <span className="text-sm mt-0.5 pl-3 font-mono select-none text-gray-400 dark:text-gray-500">{t("common.basic")}</span>
-            <div className="w-full flex flex-col justify-start items-start mt-1">
-              {BASIC_SECTIONS.map((item) => (
-                <SectionMenuItem
-                  key={item}
-                  text={t(`setting.${item}`)}
-                  icon={SECTION_ICON_MAP[item]}
-                  isSelected={state.selectedSection === item}
-                  onClick={() => handleSectionSelectorItemClick(item)}
-                />
-              ))}
-            </div>
-            {isHost ? (
-              <>
-                <span className="text-sm mt-4 pl-3 font-mono select-none text-gray-400 dark:text-gray-500">{t("common.admin")}</span>
-                <div className="w-full flex flex-col justify-start items-start mt-1">
-                  {ADMIN_SECTIONS.map((item) => (
-                    <SectionMenuItem
-                      key={item}
-                      text={t(`setting.${item}`)}
-                      icon={SECTION_ICON_MAP[item]}
-                      isSelected={state.selectedSection === item}
-                      onClick={() => handleSectionSelectorItemClick(item)}
-                    />
-                  ))}
-                  <span className="px-3 mt-2 opacity-70 text-sm">Version: v{commonContext.profile.version}</span>
-                </div>
-              </>
-            ) : null}
-          </div>
-          <div className="w-full grow sm:pl-4 overflow-x-auto">
-            <div className="w-auto inline-block my-2 sm:hidden">
-              <Select value={state.selectedSection} onChange={(_, value) => handleSectionSelectorItemClick(value as SettingSection)}>
-                {settingsSectionList.map((settingSection) => (
-                  <Option key={settingSection} value={settingSection}>
-                    {t(`setting.${settingSection}`)}
-                  </Option>
-                ))}
-              </Select>
-            </div>
-            {state.selectedSection === "my-account" ? (
-              <MyAccountSection />
-            ) : state.selectedSection === "preference" ? (
-              <PreferencesSection />
-            ) : state.selectedSection === "member" ? (
-              <MemberSection />
-            ) : state.selectedSection === "system" ? (
-              <WorkspaceSection />
-            ) : state.selectedSection === "storage" ? (
-              <StorageSection />
-            ) : state.selectedSection === "sso" ? (
-              <SSOSection />
-            ) : null}
-          </div>
+    <section className="w-full min-h-full">
+      <div className="mx-auto w-full max-w-4xl px-4 pb-12 pt-4 sm:px-6 md:pt-8">
+        <div className="min-w-0">
+          <ActiveSection />
         </div>
       </div>
     </section>

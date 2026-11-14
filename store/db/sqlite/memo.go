@@ -2,72 +2,160 @@ package sqlite
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/usememos/memos/filter"
+	storepb "github.com/usememos/memos/proto/gen/store"
 	"github.com/usememos/memos/store"
 )
 
 func (d *DB) CreateMemo(ctx context.Context, create *store.Memo) (*store.Memo, error) {
-	fields := []string{"`uid`", "`creator_id`", "`content`", "`visibility`, `tags`"}
-	placeholder := []string{"?", "?", "?", "?", "?"}
-	tags := "[]"
-	if len(create.Tags) != 0 {
-		tagsBytes, err := json.Marshal(create.Tags)
-		if err != nil {
-			return nil, err
-		}
-		tags = string(tagsBytes)
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
-	args := []any{create.UID, create.CreatorID, create.Content, create.Visibility, tags}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateSQLiteMemoCreate(ctx, tx, create); err != nil {
+		return nil, err
+	}
+	if err := insertSQLiteMemo(ctx, tx, create); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return create, nil
+}
+
+func insertSQLiteMemo(ctx context.Context, tx dbExecutor, create *store.Memo) error {
+	fields := []string{"`uid`", "`creator_id`", "`content`", "`visibility`", "`payload`", "`space_id`"}
+	placeholder := []string{"?", "?", "?", "?", "?", "?"}
+	payload := "{}"
+	if create.Payload != nil {
+		payloadBytes, err := protojson.Marshal(create.Payload)
+		if err != nil {
+			return err
+		}
+		payload = string(payloadBytes)
+	}
+	args := []any{create.UID, create.CreatorID, create.Content, create.Visibility, payload, create.SpaceID}
+
+	// Add custom timestamps if provided
+	if create.CreatedTs != 0 {
+		fields = append(fields, "`created_ts`")
+		placeholder = append(placeholder, "?")
+		args = append(args, create.CreatedTs)
+	}
+	if create.UpdatedTs != 0 {
+		fields = append(fields, "`updated_ts`")
+		placeholder = append(placeholder, "?")
+		args = append(args, create.UpdatedTs)
+	}
 
 	stmt := "INSERT INTO `memo` (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ") RETURNING `id`, `created_ts`, `updated_ts`, `row_status`"
-	if err := d.db.QueryRowContext(ctx, stmt, args...).Scan(
+	if err := tx.QueryRowContext(ctx, stmt, args...).Scan(
 		&create.ID,
 		&create.CreatedTs,
 		&create.UpdatedTs,
 		&create.RowStatus,
 	); err != nil {
-		return nil, err
+		return err
 	}
+	return nil
+}
 
-	return create, nil
+func validateSQLiteMemoCreate(ctx context.Context, tx dbExecutor, create *store.Memo) error {
+	actor, err := readSQLiteMemoActor(ctx, tx, create.CreatorID)
+	if err != nil {
+		return err
+	}
+	if !actor.Active {
+		return store.ErrMemoSpaceMembershipRequired
+	}
+	if create.SpaceID == nil {
+		return nil
+	}
+	if !actor.Admin {
+		return validateSQLiteMemoSpaceMember(ctx, tx, *create.SpaceID, create.CreatorID)
+	}
+	// An instance administrator places memos without membership; the target
+	// Space must still exist.
+	exists, err := sqliteSpaceExists(ctx, tx, *create.SpaceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrMemoSpaceNotWritable
+	}
+	return nil
+}
+
+func validateSQLiteMemoSpaceMember(ctx context.Context, tx dbExecutor, spaceID, userID int32) error {
+	exists, err := sqliteSpaceExists(ctx, tx, spaceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrMemoSpaceNotWritable
+	}
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM space_member sm JOIN user u ON u.id = sm.user_id
+		WHERE sm.space_id = ? AND sm.user_id = ? AND sm.status = 'ACTIVE'
+			AND sm.role IN ('ADMIN', 'USER') AND u.row_status = 'NORMAL')`, spaceID, userID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrMemoSpaceMembershipRequired
+	}
+	return nil
 }
 
 func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo, error) {
 	where, args := []string{"1 = 1"}, []any{}
 
+	engine, err := filter.DefaultEngine()
+	if err != nil {
+		return nil, err
+	}
+	if err := filter.AppendConditions(ctx, engine, find.Filters, filter.DialectSQLite, &where, &args); err != nil {
+		return nil, err
+	}
 	if v := find.ID; v != nil {
 		where, args = append(where, "`memo`.`id` = ?"), append(args, *v)
 	}
+	if len(find.IDList) > 0 {
+		placeholders := make([]string, 0, len(find.IDList))
+		for range find.IDList {
+			placeholders = append(placeholders, "?")
+		}
+		where = append(where, "`memo`.`id` IN ("+strings.Join(placeholders, ",")+")")
+		for _, id := range find.IDList {
+			args = append(args, id)
+		}
+	}
 	if v := find.UID; v != nil {
 		where, args = append(where, "`memo`.`uid` = ?"), append(args, *v)
+	}
+	if len(find.UIDList) > 0 {
+		placeholders := make([]string, 0, len(find.UIDList))
+		for range find.UIDList {
+			placeholders = append(placeholders, "?")
+		}
+		where = append(where, "`memo`.`uid` IN ("+strings.Join(placeholders, ",")+")")
+		for _, uid := range find.UIDList {
+			args = append(args, uid)
+		}
 	}
 	if v := find.CreatorID; v != nil {
 		where, args = append(where, "`memo`.`creator_id` = ?"), append(args, *v)
 	}
 	if v := find.RowStatus; v != nil {
 		where, args = append(where, "`memo`.`row_status` = ?"), append(args, *v)
-	}
-	if v := find.CreatedTsBefore; v != nil {
-		where, args = append(where, "`memo`.`created_ts` < ?"), append(args, *v)
-	}
-	if v := find.CreatedTsAfter; v != nil {
-		where, args = append(where, "`memo`.`created_ts` > ?"), append(args, *v)
-	}
-	if v := find.UpdatedTsBefore; v != nil {
-		where, args = append(where, "`memo`.`updated_ts` < ?"), append(args, *v)
-	}
-	if v := find.UpdatedTsAfter; v != nil {
-		where, args = append(where, "`memo`.`updated_ts` > ?"), append(args, *v)
-	}
-	if v := find.ContentSearch; len(v) != 0 {
-		for _, s := range v {
-			where, args = append(where, "`memo`.`content` LIKE ?"), append(args, fmt.Sprintf("%%%s%%", s))
-		}
 	}
 	if v := find.VisibilityList; len(v) != 0 {
 		placeholder := []string{}
@@ -77,27 +165,39 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		}
 		where = append(where, fmt.Sprintf("`memo`.`visibility` IN (%s)", strings.Join(placeholder, ",")))
 	}
-	if v := find.Tag; v != nil {
-		where, args = append(where, "JSON_EXTRACT(`memo`.`tags`, '$') LIKE ?"), append(args, fmt.Sprintf(`%%"%s"%%`, *v))
+	if v := find.CommentContextMemoID; v != nil {
+		where, args = append(where, `EXISTS (
+			SELECT 1 FROM memo_relation AS comment_context
+			WHERE comment_context.memo_id = memo.id
+				AND comment_context.related_memo_id = ?
+				AND comment_context.type = 'COMMENT'
+		)`), append(args, *v)
+	}
+	if access := find.Access; access != nil {
+		where = append(where, sqliteMemoAccessPredicate(access, "`memo`", "`access_member`", &args))
 	}
 	if find.ExcludeComments {
-		where = append(where, "`parent_id` IS NULL")
+		where = append(where, `NOT EXISTS (
+			SELECT 1 FROM memo_relation AS comment_relation
+			WHERE comment_relation.memo_id = memo.id AND comment_relation.type = 'COMMENT'
+		)`)
 	}
 
+	order := "DESC"
+	if find.OrderByTimeAsc {
+		order = "ASC"
+	}
 	orderBy := []string{}
 	if find.OrderByPinned {
 		orderBy = append(orderBy, "`pinned` DESC")
 	}
 	if find.OrderByUpdatedTs {
-		orderBy = append(orderBy, "`updated_ts` DESC")
+		orderBy = append(orderBy, "`updated_ts` "+order)
 	} else {
-		orderBy = append(orderBy, "`created_ts` DESC")
+		orderBy = append(orderBy, "`created_ts` "+order)
 	}
+	// Add id as final tie-breaker
 	orderBy = append(orderBy, "`id` DESC")
-	if find.Random {
-		orderBy = []string{"RANDOM()"}
-	}
-
 	fields := []string{
 		"`memo`.`id` AS `id`",
 		"`memo`.`uid` AS `uid`",
@@ -106,17 +206,22 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		"`memo`.`updated_ts` AS `updated_ts`",
 		"`memo`.`row_status` AS `row_status`",
 		"`memo`.`visibility` AS `visibility`",
-		"`memo`.`tags` AS `tags`",
-		"IFNULL(`memo_organizer`.`pinned`, 0) AS `pinned`",
-		"`memo_relation`.`related_memo_id` AS `parent_id`",
+		"`memo`.`pinned` AS `pinned`",
+		"`memo`.`payload` AS `payload`",
+		"`memo`.`space_id` AS `space_id`",
+		`(SELECT parent_memo.uid
+			FROM memo_relation AS parent_relation
+			JOIN memo AS parent_memo ON parent_memo.id = parent_relation.related_memo_id
+			WHERE parent_relation.memo_id = memo.id AND parent_relation.type = 'COMMENT'
+			ORDER BY parent_memo.id LIMIT 1) AS parent_uid`,
 	}
 	if !find.ExcludeContent {
 		fields = append(fields, "`memo`.`content` AS `content`")
 	}
 
-	query := "SELECT " + strings.Join(fields, ", ") + "FROM `memo` " +
-		"LEFT JOIN `memo_organizer` ON `memo`.`id` = `memo_organizer`.`memo_id` AND `memo`.`creator_id` = `memo_organizer`.`user_id` " +
-		"LEFT JOIN `memo_relation` ON `memo`.`id` = `memo_relation`.`memo_id` AND `memo_relation`.`type` = \"COMMENT\" " +
+	query := "SELECT " + strings.Join(fields, ", ") + " FROM `memo` " +
+		"LEFT JOIN `user` AS `memo_creator` ON `memo`.`creator_id` = `memo_creator`.`id` " +
+		"LEFT JOIN `space` AS `memo_space` ON `memo`.`space_id` = `memo_space`.`id` " +
 		"WHERE " + strings.Join(where, " AND ") + " " +
 		"ORDER BY " + strings.Join(orderBy, ", ")
 	if find.Limit != nil {
@@ -135,7 +240,7 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 	list := make([]*store.Memo, 0)
 	for rows.Next() {
 		var memo store.Memo
-		var tagsBytes []byte
+		var payloadBytes []byte
 		dests := []any{
 			&memo.ID,
 			&memo.UID,
@@ -144,9 +249,10 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 			&memo.UpdatedTs,
 			&memo.RowStatus,
 			&memo.Visibility,
-			&tagsBytes,
 			&memo.Pinned,
-			&memo.ParentID,
+			&payloadBytes,
+			&memo.SpaceID,
+			&memo.ParentUID,
 		}
 		if !find.ExcludeContent {
 			dests = append(dests, &memo.Content)
@@ -154,9 +260,11 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 		if err := rows.Scan(dests...); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(tagsBytes, &memo.Tags); err != nil {
-			return nil, errors.Wrap(err, "failed to unmarshal tags")
+		payload := &storepb.MemoPayload{}
+		if err := protojsonUnmarshaler.Unmarshal(payloadBytes, payload); err != nil {
+			return nil, errors.Wrap(err, "failed to unmarshal payload")
 		}
+		memo.Payload = payload
 		list = append(list, &memo)
 	}
 
@@ -167,51 +275,68 @@ func (d *DB) ListMemos(ctx context.Context, find *store.FindMemo) ([]*store.Memo
 	return list, nil
 }
 
-func (d *DB) UpdateMemo(ctx context.Context, update *store.UpdateMemo) error {
-	set, args := []string{}, []any{}
-	if v := update.UID; v != nil {
-		set, args = append(set, "`uid` = ?"), append(args, *v)
+// CountUserMemos counts the memos a user created, comments included, in every
+// row status and Space.
+func (d *DB) CountUserMemos(ctx context.Context, creatorID int32) (int64, error) {
+	stmt := `SELECT COUNT(*) FROM memo WHERE creator_id = ?`
+	var count int64
+	if err := d.db.QueryRowContext(ctx, stmt, creatorID).Scan(&count); err != nil {
+		return 0, errors.Wrap(err, "failed to count user memos")
 	}
-	if v := update.CreatedTs; v != nil {
-		set, args = append(set, "`created_ts` = ?"), append(args, *v)
-	}
-	if v := update.UpdatedTs; v != nil {
-		set, args = append(set, "`updated_ts` = ?"), append(args, *v)
-	}
-	if v := update.RowStatus; v != nil {
-		set, args = append(set, "`row_status` = ?"), append(args, *v)
-	}
-	if v := update.Content; v != nil {
-		set, args = append(set, "`content` = ?"), append(args, *v)
-	}
-	if v := update.Visibility; v != nil {
-		set, args = append(set, "`visibility` = ?"), append(args, *v)
-	}
-	if v := update.Tags; v != nil {
-		tagsBytes, err := json.Marshal(v)
-		if err != nil {
-			return err
-		}
-		set, args = append(set, "`tags` = ?"), append(args, string(tagsBytes))
-	}
-	args = append(args, update.ID)
+	return count, nil
+}
 
-	stmt := "UPDATE `memo` SET " + strings.Join(set, ", ") + " WHERE `id` = ?"
-	if _, err := d.db.ExecContext(ctx, stmt, args...); err != nil {
+func (d *DB) UpdateMemo(ctx context.Context, update *store.UpdateMemo) error {
+	if update.Policy == nil {
+		return applyMemoUpdate(ctx, d.db, update)
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := validateSQLiteMemoWritePolicy(ctx, tx, update.ID, update.Policy, update); err != nil {
+		return err
+	}
+	if err := applyMemoUpdate(ctx, tx, update); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (d *DB) DeleteMemo(ctx context.Context, delete *store.DeleteMemo) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to start memo delete transaction")
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if _, err := tx.ExecContext(ctx, "DELETE FROM `memo` WHERE `id` = ?", delete.ID); err != nil {
+		return errors.Wrap(err, "failed to delete memo")
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM `reaction` WHERE `memo_id` = ?", delete.ID); err != nil {
+		return errors.Wrap(err, "failed to delete memo reactions")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Wrap(err, "failed to commit memo delete transaction")
 	}
 	return nil
 }
 
-func (d *DB) DeleteMemo(ctx context.Context, delete *store.DeleteMemo) error {
-	where, args := []string{"`id` = ?"}, []any{delete.ID}
-	stmt := "DELETE FROM `memo` WHERE " + strings.Join(where, " AND ")
-	result, err := d.db.ExecContext(ctx, stmt, args...)
+// RefreshMemoDerivedPayload sets the payload's tags and property while the
+// content is unchanged; JSON_SET keeps every other payload key.
+func (d *DB) RefreshMemoDerivedPayload(ctx context.Context, refresh *store.RefreshMemoDerivedPayload) error {
+	tags, property, err := refresh.JSON()
 	if err != nil {
 		return err
 	}
-	if _, err := result.RowsAffected(); err != nil {
-		return err
+	if _, err := d.db.ExecContext(ctx,
+		"UPDATE `memo` SET `payload` = JSON_SET(COALESCE(NULLIF(`payload`, ''), '{}'), '$.tags', JSON(?), '$.property', JSON(?)) WHERE `id` = ? AND `content` = ?",
+		tags, property, refresh.ID, refresh.Content,
+	); err != nil {
+		return errors.Wrap(err, "failed to refresh memo payload")
 	}
 	return nil
 }

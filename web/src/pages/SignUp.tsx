@@ -1,56 +1,52 @@
-import { Button, Input } from "@mui/joy";
-import { ClientError } from "nice-grpc-web";
+import { create } from "@bufbuild/protobuf";
+import { timestampDate } from "@bufbuild/protobuf/wkt";
+import { Button } from "@usememos/ui";
 import { useState } from "react";
-import { toast } from "react-hot-toast";
-import { Link } from "react-router-dom";
-import AppearanceSelect from "@/components/AppearanceSelect";
-import LocaleSelect from "@/components/LocaleSelect";
-import { authServiceClient } from "@/grpcweb";
+import { Navigate, useSearchParams } from "react-router-dom";
+import { setAccessToken } from "@/auth-state";
+import AuthNotice from "@/components/AuthNotice";
+import AuthPageLayout, { AuthLinkPrompt } from "@/components/AuthPageLayout";
+import ChallengeWidget, { CHALLENGE_TOKEN_HEADER } from "@/components/ChallengeWidget";
+import CredentialFields from "@/components/CredentialFields";
+import { authServiceClient, userServiceClient } from "@/connect";
+import { useAuth } from "@/contexts/AuthContext";
+import { useInstance } from "@/contexts/InstanceContext";
 import useLoading from "@/hooks/useLoading";
 import useNavigateTo from "@/hooks/useNavigateTo";
-import { useCommonContext } from "@/layouts/CommonContextProvider";
-import { useUserStore, useWorkspaceSettingStore } from "@/store/v1";
-import { WorkspaceGeneralSetting } from "@/types/proto/api/v1/workspace_setting_service";
-import { WorkspaceSettingKey } from "@/types/proto/store/workspace_setting";
+import { ERROR_REASON_CHALLENGE_REQUIRED, getErrorMessage, hasErrorReason } from "@/lib/error";
+import { ROUTES } from "@/router/routes";
+import { User_Role, UserSchema } from "@/types/proto/api/user_service_pb";
+import {
+  AUTH_REASON_PARAM,
+  AUTH_REASON_SIGNUPS_CLOSED,
+  AUTH_REDIRECT_PARAM,
+  appendSearchParams,
+  getSafeRedirectPath,
+} from "@/utils/auth-redirect";
 import { useTranslate } from "@/utils/i18n";
 
 const SignUp = () => {
   const t = useTranslate();
   const navigateTo = useNavigateTo();
-  const commonContext = useCommonContext();
-  const workspaceSettingStore = useWorkspaceSettingStore();
-  const userStore = useUserStore();
   const actionBtnLoadingState = useLoading(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const workspaceGeneralSetting =
-    workspaceSettingStore.getWorkspaceSettingByKey(WorkspaceSettingKey.WORKSPACE_SETTING_GENERAL).generalSetting ||
-    WorkspaceGeneralSetting.fromPartial({});
+  const [errorMessage, setErrorMessage] = useState("");
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [challengeResetKey, setChallengeResetKey] = useState(0);
+  const { initialize: initAuth } = useAuth();
+  const { generalSetting: instanceGeneralSetting, profile, initialize: initInstance } = useInstance();
+  const [searchParams] = useSearchParams();
+  const redirectTarget = getSafeRedirectPath(searchParams.get(AUTH_REDIRECT_PARAM));
+  const signInPath = appendSearchParams(ROUTES.AUTH, searchParams);
 
-  const handleUsernameInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setUsername(text);
-  };
+  const passwordAuthAllowed = !instanceGeneralSetting.disallowPasswordAuth;
+  const registrationOpen = !instanceGeneralSetting.disallowUserRegistration;
+  const needsSetup = profile.needsSetup;
 
-  const handlePasswordInputChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const text = e.target.value as string;
-    setPassword(text);
-  };
-
-  const handleLocaleSelectChange = (locale: Locale) => {
-    commonContext.setLocale(locale);
-  };
-
-  const handleAppearanceSelectChange = (appearance: Appearance) => {
-    commonContext.setAppearance(appearance);
-  };
-
-  const handleFormSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleFormSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    handleSignUpButtonClick();
-  };
 
-  const handleSignUpButtonClick = async () => {
     if (username === "" || password === "") {
       return;
     }
@@ -61,81 +57,84 @@ const SignUp = () => {
 
     try {
       actionBtnLoadingState.setLoading();
-      await authServiceClient.signUp({ username, password });
-      await userStore.fetchCurrentUser();
-      navigateTo("/");
-    } catch (error: any) {
+      setErrorMessage("");
+      const user = create(UserSchema, {
+        username,
+        password,
+        role: User_Role.USER,
+      });
+      // The token is spent by createUser; the sign-in that follows is not a
+      // credential guess, and the server does not ask for a second one there.
+      const callOptions = challengeToken ? { headers: { [CHALLENGE_TOKEN_HEADER]: challengeToken } } : undefined;
+      await userServiceClient.createUser({ user }, callOptions);
+      const response = await authServiceClient.signIn(
+        {
+          credentials: {
+            case: "passwordCredentials",
+            value: { username, password },
+          },
+        },
+        callOptions,
+      );
+      // Store access token from login response
+      if (response.accessToken) {
+        setAccessToken(response.accessToken, response.accessTokenExpireTime ? timestampDate(response.accessTokenExpireTime) : undefined);
+      }
+      // Refresh auth context to load the current user
+      await initAuth();
+      // Refetch instance profile to update the initialized status
+      await initInstance();
+      navigateTo(redirectTarget || ROUTES.HOME, { replace: true });
+    } catch (error: unknown) {
       console.error(error);
-      toast.error((error as ClientError).details || "Sign up failed");
+      if (hasErrorReason(error, ERROR_REASON_CHALLENGE_REQUIRED)) {
+        setChallengeResetKey((key) => key + 1);
+      }
+      setErrorMessage(getErrorMessage(error, t("error.sign-up-failed")));
     }
     actionBtnLoadingState.setFinish();
   };
 
+  // Without password accounts, an identity provider creates the account on first sign-in, so sign-up is sign-in.
+  if (!needsSetup && (!registrationOpen || !passwordAuthAllowed)) {
+    const params = new URLSearchParams(searchParams);
+    if (!registrationOpen) {
+      params.set(AUTH_REASON_PARAM, AUTH_REASON_SIGNUPS_CLOSED);
+    }
+    return <Navigate to={appendSearchParams(ROUTES.AUTH, params)} replace />;
+  }
+
+  const submitLabel = needsSetup ? t("auth.create-admin-account") : t("common.sign-up");
+
   return (
-    <div className="py-4 sm:py-8 w-80 max-w-full min-h-[100svh] mx-auto flex flex-col justify-start items-center">
-      <div className="w-full py-4 grow flex flex-col justify-center items-center">
-        <div className="w-full flex flex-row justify-center items-center mb-6">
-          <img className="h-14 w-auto rounded-full shadow" src={workspaceGeneralSetting.customProfile?.logoUrl || "/logo.webp"} alt="" />
-          <p className="ml-2 text-5xl text-black opacity-80 dark:text-gray-200">
-            {workspaceGeneralSetting.customProfile?.title || "Memos"}
-          </p>
-        </div>
-        <p className="w-full text-2xl mt-2 dark:text-gray-500">{t("auth.create-your-account")}</p>
-        <form className="w-full mt-2" onSubmit={handleFormSubmit}>
-          <div className="flex flex-col justify-start items-start w-full gap-4">
-            <div className="w-full flex flex-col justify-start items-start gap-2">
-              <span className="leading-8 text-gray-600">{t("common.username")}</span>
-              <Input
-                className="w-full"
-                size="lg"
-                type="text"
-                readOnly={actionBtnLoadingState.isLoading}
-                placeholder={t("common.username")}
-                value={username}
-                onChange={handleUsernameInputChanged}
-                required
-              />
-            </div>
-            <div className="w-full flex flex-col justify-start items-start gap-2">
-              <span className="leading-8 text-gray-600">{t("common.password")}</span>
-              <Input
-                className="w-full"
-                size="lg"
-                type="password"
-                readOnly={actionBtnLoadingState.isLoading}
-                placeholder={t("common.password")}
-                value={password}
-                onChange={handlePasswordInputChanged}
-                required
-              />
-            </div>
-          </div>
-          <div className="flex flex-row justify-end items-center w-full mt-6">
-            <Button
-              className="w-full"
-              size="md"
-              type="submit"
-              disabled={actionBtnLoadingState.isLoading}
-              loading={actionBtnLoadingState.isLoading}
-              onClick={handleSignUpButtonClick}
-            >
-              {t("common.sign-up")}
-            </Button>
-          </div>
-        </form>
-        {!commonContext.profile.owner && <p className="w-full mt-4 text-sm font-medium dark:text-gray-500">{t("auth.host-tip")}</p>}
-        <p className="w-full mt-4 text-sm">
-          <span className="dark:text-gray-500">{t("auth.sign-in-tip")}</span>
-          <Link to="/auth" className="cursor-pointer ml-2 text-blue-600 hover:underline" unstable_viewTransition>
-            {t("common.sign-in")}
-          </Link>
-        </p>
-      </div>
-      <div className="mt-4 flex flex-row items-center justify-center w-full gap-2">
-        <LocaleSelect value={commonContext.locale} onChange={handleLocaleSelectChange} />
-        <AppearanceSelect value={commonContext.appearance as Appearance} onChange={handleAppearanceSelectChange} />
-      </div>
-    </div>
+    <AuthPageLayout
+      title={needsSetup ? t("auth.setup-title") : t("auth.create-your-account")}
+      description={needsSetup ? t("auth.setup-description") : undefined}
+    >
+      <form className="flex w-full flex-col gap-4" onSubmit={handleFormSubmit}>
+        <CredentialFields
+          idPrefix="signup"
+          username={username}
+          password={password}
+          passwordAutoComplete="new-password"
+          readOnly={actionBtnLoadingState.isLoading}
+          onUsernameChange={(value) => {
+            setUsername(value);
+            setErrorMessage("");
+          }}
+          onPasswordChange={(value) => {
+            setPassword(value);
+            setErrorMessage("");
+          }}
+        />
+        {!needsSetup && <ChallengeWidget onToken={setChallengeToken} resetKey={challengeResetKey} />}
+        {errorMessage && <AuthNotice tone="error">{errorMessage}</AuthNotice>}
+        <Button variant="primary" type="submit" loading={actionBtnLoadingState.isLoading} loadingLabel={submitLabel}>
+          {submitLabel}
+        </Button>
+      </form>
+      {!needsSetup && <AuthLinkPrompt prompt={t("auth.sign-in-tip")} to={signInPath} label={t("common.sign-in")} />}
+    </AuthPageLayout>
   );
 };
 

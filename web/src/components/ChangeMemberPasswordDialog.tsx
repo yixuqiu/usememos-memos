@@ -1,32 +1,32 @@
-import { Button, IconButton, Input } from "@mui/joy";
-import { useEffect, useState } from "react";
-import { toast } from "react-hot-toast";
-import { useUserStore } from "@/store/v1";
-import { User } from "@/types/proto/api/v1/user_service";
+import { Button, Dialog, Field, Input } from "@usememos/ui";
+import { useState } from "react";
+import { useFieldErrors } from "@/hooks/useFieldErrors";
+import { useUpdateUser } from "@/hooks/useUserQueries";
+import { handleError } from "@/lib/error";
+import { showErrorToast, toast } from "@/lib/toast";
+import { User } from "@/types/proto/api/user_service_pb";
 import { useTranslate } from "@/utils/i18n";
-import { generateDialog } from "./Dialog";
-import Icon from "./Icon";
 
-interface Props extends DialogProps {
-  user: User;
+interface Props {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  user?: User;
+  onSuccess?: () => void;
 }
 
-const ChangeMemberPasswordDialog: React.FC<Props> = (props: Props) => {
-  const { user, destroy } = props;
+function ChangeMemberPasswordDialog({ open, onOpenChange, user, onSuccess }: Props) {
   const t = useTranslate();
-  const userStore = useUserStore();
+  const fieldErrors = useFieldErrors<"newPassword" | "newPasswordAgain">();
+  const { mutateAsync: updateUser } = useUpdateUser();
   const [newPassword, setNewPassword] = useState("");
   const [newPasswordAgain, setNewPasswordAgain] = useState("");
 
-  useEffect(() => {
-    // do nth
-  }, []);
-
   const handleCloseBtnClick = () => {
-    destroy();
+    onOpenChange(false);
   };
 
   const handleNewPasswordChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
+    fieldErrors.clear("newPassword");
     const text = e.target.value as string;
     setNewPassword(text);
   };
@@ -34,85 +34,84 @@ const ChangeMemberPasswordDialog: React.FC<Props> = (props: Props) => {
   const handleNewPasswordAgainChanged = (e: React.ChangeEvent<HTMLInputElement>) => {
     const text = e.target.value as string;
     setNewPasswordAgain(text);
+    fieldErrors.clear("newPasswordAgain");
   };
 
   const handleSaveBtnClick = async () => {
+    if (!user) return;
+
     if (newPassword === "" || newPasswordAgain === "") {
-      toast.error(t("message.fill-all"));
+      fieldErrors.set(newPassword === "" ? "newPassword" : "newPasswordAgain", t("message.fill-all"));
       return;
     }
 
     if (newPassword !== newPasswordAgain) {
-      toast.error(t("message.new-password-not-match"));
+      fieldErrors.set("newPasswordAgain", t("message.new-password-not-match"));
       setNewPasswordAgain("");
       return;
     }
 
     try {
-      await userStore.updateUser(
-        {
+      await updateUser({
+        user: {
           name: user.name,
           password: newPassword,
         },
-        ["password"],
-      );
-      toast(t("message.password-changed"));
-      handleCloseBtnClick();
-    } catch (error: any) {
-      console.error(error);
-      toast.error(error.details);
+        updateMask: ["password"],
+      });
+      toast.add({ title: t("message.password-changed") });
+      onSuccess?.();
+      onOpenChange(false);
+    } catch (error: unknown) {
+      await handleError(error, showErrorToast, {
+        context: "Change member password",
+      });
     }
   };
 
+  if (!user) return null;
+
   return (
-    <>
-      <div className="dialog-header-container !w-64">
-        <p className="title-text">
-          {t("setting.account-section.change-password")} ({user.nickname})
-        </p>
-        <IconButton size="sm" onClick={handleCloseBtnClick}>
-          <Icon.X className="w-5 h-auto" />
-        </IconButton>
-      </div>
-      <div className="dialog-content-container">
-        <p className="text-sm mb-1">{t("auth.new-password")}</p>
-        <Input
-          className="w-full"
-          type="password"
-          placeholder={t("auth.new-password")}
-          value={newPassword}
-          onChange={handleNewPasswordChanged}
-        />
-        <p className="text-sm mb-1 mt-2">{t("auth.repeat-new-password")}</p>
-        <Input
-          className="w-full"
-          type="password"
-          placeholder={t("auth.repeat-new-password")}
-          value={newPasswordAgain}
-          onChange={handleNewPasswordAgainChanged}
-        />
-        <div className="flex flex-row justify-end items-center mt-4 w-full gap-x-2">
-          <Button color="neutral" variant="plain" onClick={handleCloseBtnClick}>
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Popup closeLabel={t("common.close")}>
+        <Dialog.Title>
+          {t("setting.account.change-password")} ({user.displayName})
+        </Dialog.Title>
+        <div className="flex flex-col gap-4">
+          <Field.Root invalid={!!fieldErrors.errors.newPassword}>
+            <Field.Label>{t("auth.new-password")}</Field.Label>
+            <Input
+              id="newPassword"
+              type="password"
+              placeholder={t("auth.new-password")}
+              value={newPassword}
+              onChange={handleNewPasswordChanged}
+            />
+            {fieldErrors.errors.newPassword && <Field.Error match>{fieldErrors.errors.newPassword}</Field.Error>}
+          </Field.Root>
+          <Field.Root invalid={!!fieldErrors.errors.newPasswordAgain}>
+            <Field.Label>{t("auth.repeat-new-password")}</Field.Label>
+            <Input
+              id="newPasswordAgain"
+              type="password"
+              placeholder={t("auth.repeat-new-password")}
+              value={newPasswordAgain}
+              onChange={handleNewPasswordAgainChanged}
+            />
+            {fieldErrors.errors.newPasswordAgain && <Field.Error match>{fieldErrors.errors.newPasswordAgain}</Field.Error>}
+          </Field.Root>
+        </div>
+        <Dialog.Footer>
+          <Button variant="ghost" onClick={handleCloseBtnClick}>
             {t("common.cancel")}
           </Button>
-          <Button color="primary" onClick={handleSaveBtnClick}>
+          <Button variant="primary" onClick={handleSaveBtnClick}>
             {t("common.save")}
           </Button>
-        </div>
-      </div>
-    </>
-  );
-};
-
-function showChangeMemberPasswordDialog(user: User) {
-  generateDialog(
-    {
-      className: "change-member-password-dialog",
-      dialogName: "change-member-password-dialog",
-    },
-    ChangeMemberPasswordDialog,
-    { user },
+        </Dialog.Footer>
+      </Dialog.Popup>
+    </Dialog.Root>
   );
 }
 
-export default showChangeMemberPasswordDialog;
+export default ChangeMemberPasswordDialog;

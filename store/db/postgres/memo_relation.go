@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/usememos/memos/filter"
 	"github.com/usememos/memos/store"
 )
 
@@ -15,6 +17,7 @@ func (d *DB) UpsertMemoRelation(ctx context.Context, create *store.MemoRelation)
 			type
 		)
 		VALUES (` + placeholders(3) + `)
+		ON CONFLICT (memo_id, related_memo_id, type) DO UPDATE SET type = EXCLUDED.type
 		RETURNING memo_id, related_memo_id, type
 	`
 	memoRelation := &store.MemoRelation{}
@@ -38,22 +41,94 @@ func (d *DB) UpsertMemoRelation(ctx context.Context, create *store.MemoRelation)
 func (d *DB) ListMemoRelations(ctx context.Context, find *store.FindMemoRelation) ([]*store.MemoRelation, error) {
 	where, args := []string{"1 = 1"}, []any{}
 	if find.MemoID != nil {
-		where, args = append(where, "memo_id = "+placeholder(len(args)+1)), append(args, find.MemoID)
+		where, args = append(where, "memo_id = "+placeholder(len(args)+1)), append(args, *find.MemoID)
 	}
 	if find.RelatedMemoID != nil {
-		where, args = append(where, "related_memo_id = "+placeholder(len(args)+1)), append(args, find.RelatedMemoID)
+		where, args = append(where, "related_memo_id = "+placeholder(len(args)+1)), append(args, *find.RelatedMemoID)
 	}
 	if find.Type != nil {
-		where, args = append(where, "type = "+placeholder(len(args)+1)), append(args, find.Type)
+		where, args = append(where, "type = "+placeholder(len(args)+1)), append(args, *find.Type)
+	}
+	if len(find.MemoIDList) > 0 {
+		placeholders := make([]string, len(find.MemoIDList))
+		for i, id := range find.MemoIDList {
+			placeholders[i] = placeholder(len(args) + 1)
+			args = append(args, id)
+		}
+		inClause := strings.Join(placeholders, ", ")
+		relatedPlaceholders := make([]string, len(find.MemoIDList))
+		for i, id := range find.MemoIDList {
+			relatedPlaceholders[i] = placeholder(len(args) + 1)
+			args = append(args, id)
+		}
+		where = append(where, fmt.Sprintf("(memo_id IN (%s) OR related_memo_id IN (%s))", inClause, strings.Join(relatedPlaceholders, ", ")))
+	}
+	if len(find.SourceMemoIDList) > 0 {
+		placeholders := make([]string, len(find.SourceMemoIDList))
+		for i, id := range find.SourceMemoIDList {
+			placeholders[i] = placeholder(len(args) + 1)
+			args = append(args, id)
+		}
+		where = append(where, fmt.Sprintf("memo_id IN (%s)", strings.Join(placeholders, ", ")))
+	}
+	if len(find.RelatedMemoIDList) > 0 {
+		placeholders := make([]string, len(find.RelatedMemoIDList))
+		for i, id := range find.RelatedMemoIDList {
+			placeholders[i] = placeholder(len(args) + 1)
+			args = append(args, id)
+		}
+		where = append(where, fmt.Sprintf("related_memo_id IN (%s)", strings.Join(placeholders, ", ")))
+	}
+	if find.SourceMemoRowStatus != nil {
+		where = append(where, "memo_id IN (SELECT id FROM memo WHERE row_status = "+placeholder(len(args)+1)+")")
+		args = append(args, *find.SourceMemoRowStatus)
+	}
+	if find.MemoFilter != nil {
+		engine, err := filter.DefaultEngine()
+		if err != nil {
+			return nil, err
+		}
+		stmt, err := engine.CompileToStatement(ctx, *find.MemoFilter, filter.RenderOptions{
+			Dialect:           filter.DialectPostgres,
+			PlaceholderOffset: len(args),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if stmt.SQL != "" {
+			where = append(where, fmt.Sprintf("memo_id IN (SELECT id FROM memo WHERE %s)", stmt.SQL))
+			args = append(args, stmt.Args...)
+
+			stmtRelated, err := engine.CompileToStatement(ctx, *find.MemoFilter, filter.RenderOptions{
+				Dialect:           filter.DialectPostgres,
+				PlaceholderOffset: len(args),
+			})
+			if err != nil {
+				return nil, err
+			}
+			if stmtRelated.SQL != "" {
+				where = append(where, fmt.Sprintf("related_memo_id IN (SELECT id FROM memo WHERE %s)", stmtRelated.SQL))
+				args = append(args, stmtRelated.Args...)
+			}
+		}
 	}
 
-	rows, err := d.db.QueryContext(ctx, `
+	query := `
 		SELECT
 			memo_id,
 			related_memo_id,
 			type
 		FROM memo_relation
-		WHERE `+strings.Join(where, " AND "), args...)
+		WHERE ` + strings.Join(where, " AND ") + `
+		ORDER BY memo_id DESC`
+	if find.Limit != nil {
+		query = fmt.Sprintf("%s LIMIT %d", query, *find.Limit)
+		if find.Offset != nil {
+			query = fmt.Sprintf("%s OFFSET %d", query, *find.Offset)
+		}
+	}
+
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -80,16 +155,17 @@ func (d *DB) ListMemoRelations(ctx context.Context, find *store.FindMemoRelation
 }
 
 func (d *DB) DeleteMemoRelation(ctx context.Context, delete *store.DeleteMemoRelation) error {
+	if err := store.ValidateMemoRelationDelete(delete); err != nil {
+		return err
+	}
 	where, args := []string{"1 = 1"}, []any{}
 	if delete.MemoID != nil {
-		where, args = append(where, "memo_id = "+placeholder(len(args)+1)), append(args, delete.MemoID)
+		where, args = append(where, "memo_id = "+placeholder(len(args)+1)), append(args, *delete.MemoID)
 	}
 	if delete.RelatedMemoID != nil {
-		where, args = append(where, "related_memo_id = "+placeholder(len(args)+1)), append(args, delete.RelatedMemoID)
+		where, args = append(where, "related_memo_id = "+placeholder(len(args)+1)), append(args, *delete.RelatedMemoID)
 	}
-	if delete.Type != nil {
-		where, args = append(where, "type = "+placeholder(len(args)+1)), append(args, delete.Type)
-	}
+	where, args = append(where, "type = "+placeholder(len(args)+1)), append(args, *delete.Type)
 	stmt := `DELETE FROM memo_relation WHERE ` + strings.Join(where, " AND ")
 	result, err := d.db.ExecContext(ctx, stmt, args...)
 	if err != nil {

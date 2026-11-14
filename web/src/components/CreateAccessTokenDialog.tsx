@@ -1,46 +1,52 @@
-import { Button, IconButton, Input, Radio, RadioGroup } from "@mui/joy";
-import React, { useState } from "react";
-import { toast } from "react-hot-toast";
-import { userServiceClient } from "@/grpcweb";
+import { Button, Dialog, Field, Input, Select, Textarea } from "@usememos/ui";
+import copy from "copy-to-clipboard";
+import React, { useEffect, useState } from "react";
+import { userServiceClient } from "@/connect";
 import useCurrentUser from "@/hooks/useCurrentUser";
+import { useFieldErrors } from "@/hooks/useFieldErrors";
 import useLoading from "@/hooks/useLoading";
+import { handleError } from "@/lib/error";
+import { showErrorToast, toast } from "@/lib/toast";
+import { CreatePersonalAccessTokenResponse } from "@/types/proto/api/user_service_pb";
 import { useTranslate } from "@/utils/i18n";
-import { generateDialog } from "./Dialog";
-import Icon from "./Icon";
 
-interface Props extends DialogProps {
-  onConfirm: () => void;
+interface Props {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSuccess: (response: CreatePersonalAccessTokenResponse) => void;
 }
-
-const expirationOptions = [
-  {
-    label: "8 hours",
-    value: 3600 * 8,
-  },
-  {
-    label: "1 month",
-    value: 3600 * 24 * 30,
-  },
-  {
-    label: "Never",
-    value: 0,
-  },
-];
 
 interface State {
   description: string;
   expiration: number;
 }
 
-const CreateAccessTokenDialog: React.FC<Props> = (props: Props) => {
-  const { destroy, onConfirm } = props;
+function CreateAccessTokenDialog({ open, onOpenChange, onSuccess }: Props) {
   const t = useTranslate();
+  const fieldErrors = useFieldErrors<"description">();
   const currentUser = useCurrentUser();
   const [state, setState] = useState({
     description: "",
-    expiration: 3600 * 8,
+    expiration: 0, // Default: never expires
   });
+  const [createdToken, setCreatedToken] = useState<string | null>(null);
   const requestState = useLoading(false);
+
+  // Expiration options in days (0 = never expires)
+  const expirationOptions = [
+    {
+      label: t("setting.access-token.create-dialog.duration-never"),
+      value: 0,
+    },
+    {
+      label: t("setting.access-token.create-dialog.duration-1m"),
+      value: 30,
+    },
+    {
+      label: t("setting.access-token.create-dialog.duration-90d"),
+      value: 90,
+    },
+  ];
 
   const setPartialState = (partialState: Partial<State>) => {
     setState({
@@ -50,97 +56,129 @@ const CreateAccessTokenDialog: React.FC<Props> = (props: Props) => {
   };
 
   const handleDescriptionInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    fieldErrors.clear("description");
     setPartialState({
       description: e.target.value,
     });
   };
 
-  const handleRoleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setPartialState({
-      expiration: Number(e.target.value),
-    });
-  };
-
   const handleSaveBtnClick = async () => {
     if (!state.description) {
-      toast.error("Description is required");
+      fieldErrors.set("description", t("message.description-is-required"));
       return;
     }
 
     try {
-      await userServiceClient.createUserAccessToken({
-        name: currentUser.name,
+      requestState.setLoading();
+      const response = await userServiceClient.createPersonalAccessToken({
+        parent: currentUser?.name,
         description: state.description,
-        expiresAt: state.expiration ? new Date(Date.now() + state.expiration * 1000) : undefined,
+        expiresInDays: state.expiration,
       });
 
-      onConfirm();
-      destroy();
-    } catch (error: any) {
-      console.error(error);
-      toast.error(error.response.data.message);
+      requestState.setFinish();
+      onSuccess(response);
+      if (response.token) {
+        setCreatedToken(response.token);
+      } else {
+        onOpenChange(false);
+      }
+    } catch (error: unknown) {
+      handleError(error, showErrorToast, {
+        context: "Create access token",
+        onError: () => requestState.setError(),
+      });
     }
   };
 
-  return (
-    <>
-      <div className="dialog-header-container">
-        <p className="title-text">Create access token</p>
-        <IconButton size="sm" onClick={() => destroy()}>
-          <Icon.X className="w-5 h-auto" />
-        </IconButton>
-      </div>
-      <div className="dialog-content-container !w-80">
-        <div className="w-full flex flex-col justify-start items-start mb-3">
-          <span className="mb-2">
-            Description <span className="text-red-600">*</span>
-          </span>
-          <div className="relative w-full">
-            <Input
-              className="w-full"
-              type="text"
-              placeholder="Some description"
-              value={state.description}
-              onChange={handleDescriptionInputChange}
-            />
-          </div>
-        </div>
-        <div className="w-full flex flex-col justify-start items-start mb-3">
-          <span className="mb-2">
-            Expiration <span className="text-red-600">*</span>
-          </span>
-          <div className="w-full flex flex-row justify-start items-center text-base">
-            <RadioGroup orientation="horizontal" value={state.expiration} onChange={handleRoleInputChange}>
-              {expirationOptions.map((option) => (
-                <Radio key={option.value} value={option.value} checked={state.expiration === option.value} label={option.label} />
-              ))}
-            </RadioGroup>
-          </div>
-        </div>
-        <div className="w-full flex flex-row justify-end items-center mt-4 space-x-2">
-          <Button color="neutral" variant="plain" disabled={requestState.isLoading} loading={requestState.isLoading} onClick={destroy}>
-            {t("common.cancel")}
-          </Button>
-          <Button color="primary" disabled={requestState.isLoading} loading={requestState.isLoading} onClick={handleSaveBtnClick}>
-            {t("common.create")}
-          </Button>
-        </div>
-      </div>
-    </>
-  );
-};
+  const handleCopyToken = () => {
+    if (!createdToken) return;
+    copy(createdToken);
+    toast.add({ title: t("message.copied"), type: "success" });
+  };
 
-function showCreateAccessTokenDialog(onConfirm: () => void) {
-  generateDialog(
-    {
-      className: "create-access-token-dialog",
-      dialogName: "create-access-token-dialog",
-    },
-    CreateAccessTokenDialog,
-    {
-      onConfirm,
-    },
+  useEffect(() => {
+    if (!open) return;
+    setState({
+      description: "",
+      expiration: 0,
+    });
+    setCreatedToken(null);
+  }, [open]);
+
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Popup closeLabel={t("common.close")}>
+        <Dialog.Title>{t("setting.access-token.create-dialog.create-access-token")}</Dialog.Title>
+        {createdToken ? (
+          <div className="flex flex-col gap-4">
+            <Field.Root>
+              <Field.Label>{t("setting.access-token.token")}</Field.Label>
+              <Textarea value={createdToken} readOnly rows={3} className="font-mono" />
+            </Field.Root>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            <Field.Root invalid={!!fieldErrors.errors.description}>
+              <Field.Label>
+                {t("setting.access-token.create-dialog.description")} <span className="text-mu-danger">*</span>
+              </Field.Label>
+              <Input
+                id="description"
+                type="text"
+                placeholder={t("setting.access-token.create-dialog.some-description")}
+                value={state.description}
+                onChange={handleDescriptionInputChange}
+              />
+              {fieldErrors.errors.description && <Field.Error match>{fieldErrors.errors.description}</Field.Error>}
+            </Field.Root>
+            <Field.Root>
+              <Field.Label>
+                {t("setting.access-token.create-dialog.expiration")} <span className="text-mu-danger">*</span>
+              </Field.Label>
+              <Select.Root
+                items={expirationOptions}
+                value={state.expiration}
+                onValueChange={(expiration) => expiration !== null && setPartialState({ expiration })}
+              >
+                <Select.Trigger>
+                  <Select.Value />
+                </Select.Trigger>
+                <Select.Popup>
+                  {expirationOptions.map((option) => (
+                    <Select.Item key={option.value} value={option.value}>
+                      {option.label}
+                    </Select.Item>
+                  ))}
+                </Select.Popup>
+              </Select.Root>
+            </Field.Root>
+          </div>
+        )}
+        <Dialog.Footer>
+          {createdToken ? (
+            <>
+              <Button variant="ghost" onClick={handleCopyToken}>
+                {t("common.copy")}
+              </Button>
+              <Button variant="primary" onClick={() => onOpenChange(false)}>
+                {t("common.close")}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button variant="ghost" disabled={requestState.isLoading} onClick={() => onOpenChange(false)}>
+                {t("common.cancel")}
+              </Button>
+              <Button variant="primary" disabled={requestState.isLoading} onClick={handleSaveBtnClick}>
+                {t("common.create")}
+              </Button>
+            </>
+          )}
+        </Dialog.Footer>
+      </Dialog.Popup>
+    </Dialog.Root>
   );
 }
 
-export default showCreateAccessTokenDialog;
+export default CreateAccessTokenDialog;
